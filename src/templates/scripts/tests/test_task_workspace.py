@@ -811,6 +811,16 @@ class ValidationProfilesRoundTripTests(unittest.TestCase):
                                        "argv": [sys.executable, "-c", "pass"]},
         }
 
+    def test_policy_field_mismatch_names_missing_and_extra_keys(self) -> None:
+        config = self.base_config()
+        del config["full_suite_validation"]
+        config["unexpected_policy"] = True
+        self.write_config(config)
+        with self.assertRaisesRegex(
+                task_runtime.TaskWorkspaceError,
+                r"missing fields: full_suite_validation; extra fields: unexpected_policy"):
+            task_runtime.load_config(self.controller)
+
     def test_absent_profiles_stay_absent_across_renormalization(self) -> None:
         self.write_config(self.base_config())
         first = task_runtime.load_config(self.controller)
@@ -1094,6 +1104,7 @@ class TaskWorkspaceFixture(unittest.TestCase):
             "branch_prefix": "refs/heads/task-",
             "allowed_paths": ["src"],
             "selectable_paths": ["optional"],
+            "legacy_umbrella_creation": True,
             "controller_private_paths": [".juno_task/tasks", ".juno_task/state", ".juno_task/specs", ".juno_task/ledger"],
             "focused_validation": [{"id": "focused", "cwd": "src",
                                     "timeout_seconds": timeout_seconds, "max_output_bytes": max_output_bytes,
@@ -1303,7 +1314,90 @@ class TaskWorkspaceFixture(unittest.TestCase):
 class TaskWorkspaceTests(TaskWorkspaceFixture):
     """Real-Git scenario suite for the canonical task-workspace lifecycle."""
 
-    def test_umbrella_start_freezes_exact_ordered_child_union_before_git_mutation(self) -> None:
+    def write_delivery_contract(self) -> None:
+        contract = {
+            "schema_version": task_runtime.DELIVERY_CHECKPOINT_CONTRACT_SCHEMA,
+            "tracking_task_ids": ["Y"],
+            "checkpoints": [
+                {"id": "implementation", "requirement": "Implement the bounded behavior", "final": False},
+                {"id": "acceptance", "requirement": "Validate the cumulative delivery", "final": True},
+            ],
+        }
+        task_runtime.task_file(self.controller, "X").write_text(
+            "---\nid: X\nstatus: todo\n---\nOrdinary delivery\n"
+            "[delivery_checkpoints]\n" + json.dumps(contract) +
+            "\n[/delivery_checkpoints]\n")
+
+    def test_ordinary_delivery_freezes_ordered_checkpoints_and_blocks_tracking_start(self) -> None:
+        self.write_delivery_contract()
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                    "require explicit exact --path scope"):
+            task_runtime.start(self.controller, "X")
+        started = task_runtime.start(self.controller, "X", ["src/base.txt"])
+        frozen = started["creation_receipt"]["delivery_checkpoint_contract"]
+        self.assertEqual([row["id"] for row in frozen["checkpoints"]],
+                         ["implementation", "acceptance"])
+        child = task_runtime.status(self.controller, "Y")
+        self.assertEqual(child["state"], "TRACKING_ONLY")
+        self.assertEqual(child["umbrella_owner_task_id"], "X")
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                    "reporting-only under delivery owner X"):
+            task_runtime.start(self.controller, "Y")
+        self.assertFalse((self.workspaces / "Y").exists())
+
+    def test_ordinary_delivery_records_exact_checkpoint_evidence_and_requires_final_tip(self) -> None:
+        self.write_delivery_contract()
+        started = task_runtime.start(self.controller, "X", ["src/base.txt"])
+        worktree = Path(started["worktree"])
+        plans: list[str] = []
+
+        def fake_plan(*_args: object, **_kwargs: object) -> dict[str, str]:
+            identity = "plan-" + git(worktree, "rev-parse", "HEAD")
+            plans.append(identity)
+            return {"plan_sha256": identity}
+
+        def fake_evidence(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"outcome": "PASSED", "plan_sha256": plans[-1], "receipts": []}
+
+        with mock.patch.object(task_runtime, "standing_checkpoint", side_effect=fake_plan), \
+             mock.patch.object(task_runtime, "standing_evidence_run", side_effect=fake_evidence):
+            (worktree / "src/base.txt").write_text("first\n")
+            git(worktree, "add", "src/base.txt"); git(worktree, "commit", "-m", "first checkpoint")
+            first = task_runtime.accept_delivery_checkpoint(self.controller, "X", "implementation")
+            self.assertEqual(first["projection"]["implementation_state"], "IN_PROGRESS")
+            repeated = task_runtime.accept_delivery_checkpoint(self.controller, "X", "implementation")
+            self.assertEqual(repeated["outcome"], "delivery_checkpoint_already_accepted")
+            self.assertEqual(repeated["checkpoint"]["evidence_sha256"],
+                             first["checkpoint"]["evidence_sha256"])
+            with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                        "delivery checkpoints are incomplete"):
+                task_runtime.preflight(self.controller, "X")
+            (worktree / "src/base.txt").write_text("final\n")
+            git(worktree, "add", "src/base.txt"); git(worktree, "commit", "-m", "final checkpoint")
+            final = task_runtime.accept_delivery_checkpoint(self.controller, "X", "acceptance")
+            self.assertTrue(final["projection"]["final_accepted"])
+            self.assertEqual(final["projection"]["integration_state"], "NOT_INTEGRATED")
+            preflight = task_runtime.preflight(self.controller, "X")
+            self.assertEqual(preflight["tip_sha"], final["checkpoint"]["tip_sha"])
+            (worktree / "src/base.txt").write_text("post acceptance\n")
+            git(worktree, "add", "src/base.txt"); git(worktree, "commit", "-m", "invalidate final")
+            with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                        "final cumulative delivery acceptance"):
+                task_runtime.preflight(self.controller, "X")
+
+    def test_new_umbrella_start_refuses_before_lifecycle_mutation(self) -> None:
+        declaration = self.umbrella_fixture()
+        config_path = self.controller / ".juno_task/config/task-workspace.json"
+        config = json.loads(config_path.read_text())
+        config["legacy_umbrella_creation"] = False
+        config_path.write_text(json.dumps(config) + "\n")
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                    "new umbrella execution is retired"):
+            task_runtime.start(self.controller, "X", umbrella_input=declaration)
+        self.assertFalse((self.workspaces / "X").exists())
+        self.assertNotIn("X", task_runtime.read_state(self.controller)["tasks"])
+
+    def test_legacy_fixture_umbrella_start_freezes_exact_ordered_child_union_before_git_mutation(self) -> None:
         declaration = self.umbrella_fixture()
         started = task_runtime.start(self.controller, "X", umbrella_input=declaration)
         admission = started["creation_receipt"]["umbrella_admission"]
@@ -1453,7 +1547,7 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
     def test_umbrella_reservations_block_child_start_and_duplicate_owner(self) -> None:
         declaration = self.umbrella_fixture()
         task_runtime.start(self.controller, "X", umbrella_input=declaration)
-        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "tracking-only under umbrella X"):
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "reporting-only under delivery owner X"):
             task_runtime.start(self.controller, "Y")
         task_runtime.task_file(self.controller, "X2").parent.mkdir(parents=True, exist_ok=True)
         task_runtime.task_file(self.controller, "X2").write_text(
@@ -1642,12 +1736,12 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
         child_status = task_runtime.status(self.controller, "Y")
         self.assertEqual(child_status["state"], "TRACKING_ONLY")
         self.assertEqual(child_status["umbrella_owner_task_id"], "X")
-        self.assertIn("child-checkpoint X Y", child_status["next_action"])
-        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "tracking-only under umbrella X"):
+        self.assertIn("task status X", child_status["next_action"])
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "reporting-only under delivery owner X"):
             task_runtime.preflight(self.controller, "Y")
-        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "tracking-only under umbrella X"):
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "reporting-only under delivery owner X"):
             task_runtime.finish(self.controller, "Y")
-        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "tracking-only under umbrella X"):
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "reporting-only under delivery owner X"):
             task_runtime.standing_checkpoint(self.controller, "Y")
         # The umbrella itself stays fully usable.
         self.commit_task("X", "child/one.txt")
@@ -1819,10 +1913,41 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
         repeated = task_runtime.apply_umbrella_recovery(
             self.controller, "X", plan_path, declaration, authorization)
         self.assertEqual(repeated["outcome"], "already_applied")
+        state_before_verify = task_runtime.read_state(self.controller)
+        verified = task_runtime.verify_umbrella_recovery(
+            self.controller, "X", plan_path, declaration, authorization)
+        self.assertEqual(verified["schema_version"],
+                         task_runtime.LEGACY_DELIVERY_VERIFICATION_SCHEMA)
+        self.assertEqual(verified["outcome"], "verified")
+        self.assertFalse(verified["mutation"])
+        self.assertEqual(task_runtime.read_state(self.controller), state_before_verify)
         status = task_runtime.status(self.controller, "X")
         self.assertEqual(status["umbrella_admission_status"]["authority"], "authorized_superseding")
+        self.assertEqual(status["delivery_checkpoint_status"]["current_checkpoint_id"], "Y")
+        self.assertEqual(status["delivery_checkpoint_status"]["integration_state"], "NOT_INTEGRATED")
+        child_status = task_runtime.status(self.controller, "Y")
+        self.assertTrue(child_status["reporting_only"])
+        self.assertFalse(child_status["separate_integration"])
         self.assertEqual(status["creation_receipt"], predecessor)
         self.assertEqual(status["admission_supersessions"][0]["predecessor_receipt_sha256"], predecessor_sha)
+
+    def test_start_time_umbrella_converts_to_one_ordinary_delivery_contract(self) -> None:
+        declaration = self.umbrella_fixture()
+        started = task_runtime.start(self.controller, "X", umbrella_input=declaration)
+        self.commit_task("X", "child/one.txt")
+        plan = task_runtime.build_umbrella_recovery_plan(self.controller, "X", declaration)
+        self.assertEqual(plan["newly_admitted_paths"], [])
+        plan_path = self.root / "admitted-conversion-plan.json"
+        plan_path.write_text(json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n")
+        authorization = self.recovery_authorization(plan_path, declaration)
+        applied = task_runtime.apply_umbrella_recovery(
+            self.controller, "X", plan_path, declaration, authorization)
+        self.assertEqual(applied["creation_receipt"], started["creation_receipt"])
+        self.assertEqual(applied["delivery_conversion"]["contract"]["source"],
+                         "verified_legacy_conversion")
+        status = task_runtime.status(self.controller, "X")
+        self.assertEqual(status["delivery_checkpoint_status"]["current_checkpoint_id"], "Y")
+        self.assertEqual(status["delivery_checkpoint_status"]["tracking_task_ids"], ["Y", "Z"])
 
     def test_umbrella_recovery_refuses_dirty_stale_revision_and_unauthorized_apply(self) -> None:
         declaration = self.umbrella_fixture()
@@ -2087,6 +2212,19 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
         started = self.payload("start", "X")
         self.assertEqual(started["state"], "WORKING")
 
+    def test_installed_instruction_bundle_uses_canonical_utf8_record_identity(self) -> None:
+        keys = ["😀", "a", ".dot", "é", "A", "_under"]
+        assets = {destination: {
+            "type": "script", "templateVersion": "1.2.3",
+            "sourceSha256": str(index) * 64, "installedSha256": str(index) * 64}
+                  for index, destination in enumerate(keys, start=1)}
+        self.assertEqual(task_runtime._managed_inventory_records_identity(assets),
+                         "d965b07f2505b7a1c7c7c5dfb8151409191fc8dfa37b81b4bc9ec9a2db4c6f82")
+        inventory = {"schemaVersion": 2, "packageName": "@yylo/cli",
+                     "packageVersion": "1.2.3", "assets": assets}
+        task_runtime._bind_instruction_bundle_identity(inventory)
+        self.assertTrue(task_runtime._managed_inventory_identity_valid(inventory))
+
     def test_installed_instruction_bundle_identity_rejects_mixed_hashes(self) -> None:
         assets = {}
         assets_sha = hashlib.sha256(b"[]").hexdigest()
@@ -2290,6 +2428,15 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
             ".juno_task/scripts/tests/fixtures/lifecycle-evidence-reuse-matrix.v1.json",
         }.issubset(admitted))
         self.assertNotIn(".juno_task/scripts", admitted)
+
+    def test_canonical_policy_admits_only_exact_lifecycle_acceptance_report(self) -> None:
+        canonical_policy = json.loads(
+            (SCRIPT.parent.parent / "config/task-workspace.json").read_text())
+        acceptance_path = "juno-code/docs/lifecycle-simplification-acceptance.md"
+        sibling_path = "juno-code/docs/lifecycle-simplification-acceptance-draft.md"
+
+        self.assertIn(acceptance_path, canonical_policy["allowed_paths"])
+        self.assertNotIn(sibling_path, canonical_policy["allowed_paths"])
 
     def test_start_freezes_explicit_policy_admitted_paths(self) -> None:
         started = task_runtime.start(self.controller, "X", ["optional"])
@@ -4693,6 +4840,31 @@ finished = time.monotonic()
         self.assertEqual(finished["validation_routing"],
                          {"mode": "profile", "profile_ids": ["pkg-suite"],
                           "authored_path_count": 1})
+
+    def test_declared_absent_file_is_created_without_sibling_authority(self) -> None:
+        config_path = self.controller / ".juno_task/config/task-workspace.json"
+        policy = json.loads(config_path.read_text())
+        migration_path = "juno-code/docs/lifecycle-simplification-migration.md"
+        sibling_path = "juno-code/docs/unrelated-future-contract.md"
+        policy["allowed_paths"].append(migration_path)
+        config_path.write_text(json.dumps(policy, indent=2) + "\n")
+
+        started = task_runtime.start(self.controller, "X", [migration_path])
+        self.assertEqual(started["creation_receipt"]["allowed_paths"], [migration_path])
+        self.assertEqual(started["creation_receipt"]["selected_entries"][migration_path], {
+            "mode": "000000", "type": "absent", "object": "0" * 40,
+        })
+        worktree = self.workspaces / "X"
+        destination = worktree / migration_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("# Migration contract\n")
+        git(worktree, "add", migration_path)
+        git(worktree, "commit", "-m", "add exact migration contract")
+        finished = self.payload("finish", "X")
+        self.assertEqual(finished["state"], "QUEUED")
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                    "not admitted by policy"):
+            task_runtime.start(self.controller, "Y", [sibling_path])
 
     def test_absent_allowed_root_is_creatable_and_selects_only_its_profile(self) -> None:
         config_path = self.controller / ".juno_task/config/task-workspace.json"

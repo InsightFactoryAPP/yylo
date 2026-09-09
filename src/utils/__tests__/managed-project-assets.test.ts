@@ -11,6 +11,7 @@ import {
   MANAGED_CONTROLLER_ASSETS,
   MANAGED_PROMPT_MACROS,
   ManagedProjectAssets,
+  managedAssetRecordsIdentity,
 } from '../managed-project-assets.js';
 import { runBoundedTestProcess } from '../../test-utils/bounded-process.js';
 import { withManagedUpdateRollback } from '../managed-update-transaction.js';
@@ -46,6 +47,82 @@ describe('ManagedProjectAssets', {
     await fs.remove(projectDir);
   });
 
+  it('renders schema-valid consumer policies and keeps monorepo dogfood package-bound', async () => {
+    const remote = 'https://github.com/example/consumer.git';
+    await ManagedProjectAssets.update(projectDir, {
+      silent: true,
+      localization: { targetBranch: 'trunk', gitRemoteUrl: remote },
+    });
+
+    const taskPath = path.join(projectDir, '.juno_task/config/task-workspace.json');
+    const metadataPath = path.join(projectDir, '.juno_task/config/metadata-controller.json');
+    const hydrationPath = path.join(projectDir, '.juno_task/config/worktree-hydration.yaml');
+    const task = await fs.readJson(taskPath);
+    const metadata = await fs.readJson(metadataPath);
+    const hydration = await fs.readFile(hydrationPath, 'utf8');
+    expect(task.target_ref).toBe('refs/heads/trunk');
+    expect(task.workspace_root).toBe('@state/yylo/task-worktrees');
+    expect(task.full_suite_validation.id).toBe('consumer-full-suite-canary');
+    expect(task.validation_profiles).toBeUndefined();
+    expect(task.documentation_validation.public_identities).toEqual([remote]);
+    expect(metadata.controller_branch).toBe('refs/heads/juno/controller-metadata');
+    expect(metadata.product_ref).toBe('refs/heads/trunk');
+    expect(hydration).toContain('verify-clean');
+    expect(hydration).not.toContain('juno-code');
+    expect(hydration).not.toContain('juno-benchmark');
+
+    const validation = spawnSync('python3', ['-c', [
+      'import importlib.util, pathlib, sys',
+      `root=pathlib.Path(${JSON.stringify(projectDir)})`,
+      "p=root/'.juno_task/scripts/task_workspace.py'",
+      'sys.path.insert(0, str(p.parent))',
+      "s=importlib.util.spec_from_file_location('consumer_task_workspace', p)",
+      'm=importlib.util.module_from_spec(s); s.loader.exec_module(m)',
+      'm.load_config(root)',
+    ].join(';')], { encoding: 'utf8' });
+    expect(validation.status, validation.stderr).toBe(0);
+
+    await fs.writeFile(taskPath, `${JSON.stringify({ ...task, owner_value: true }, null, 2)}\n`);
+    const preserved = await ManagedProjectAssets.update(projectDir, {
+      silent: true,
+      localization: { targetBranch: 'main', gitRemoteUrl: 'https://example.test/new' },
+    });
+    expect(preserved.conflicts.map((entry) => entry.destination)).toContain(
+      '.juno_task/config/task-workspace.json',
+    );
+    expect((await fs.readJson(taskPath)).owner_value).toBe(true);
+
+    await ManagedProjectAssets.update(projectDir, {
+      force: true,
+      silent: true,
+      localization: { targetBranch: 'main', gitRemoteUrl: 'https://example.test/new' },
+    });
+    const forced = await fs.readJson(taskPath);
+    expect(forced.owner_value).toBeUndefined();
+    expect(forced.documentation_validation.public_identities).toEqual(['https://example.test/new']);
+    expect(JSON.stringify(forced)).not.toContain('askbudi/juno-mono');
+
+    const monorepo = await fs.mkdtemp(path.join(os.tmpdir(), 'juno-managed-monorepo-'));
+    try {
+      await fs.ensureDir(path.join(monorepo, '.juno_task'));
+      await fs.writeJson(path.join(monorepo, '.juno_task/config.json'), {});
+      await fs.outputJson(path.join(monorepo, 'juno-code/package.json'), {
+        name: '@yylo/cli', version: '0.0.0-test',
+      });
+      await ManagedProjectAssets.update(monorepo, {
+        silent: true,
+        localization: { targetBranch: 'consumer-branch', gitRemoteUrl: remote },
+      });
+      expect(await fs.readFile(
+        path.join(monorepo, '.juno_task/config/task-workspace.json'), 'utf8',
+      )).toBe(await fs.readFile(
+        path.join(process.cwd(), 'src/templates/config/task-workspace.json'), 'utf8',
+      ));
+    } finally {
+      await fs.remove(monorepo);
+    }
+  });
+
   it('keeps every checked-in managed destination bound to its inventory hash', async () => {
     const productRoot = path.resolve(process.cwd(), '..');
     const inventoryPath = path.join(productRoot, '.juno_task/managed-assets.json');
@@ -53,6 +130,18 @@ describe('ManagedProjectAssets', {
 
     const inventory = await fs.readJson(inventoryPath);
     expect(inventory.packageName).toBe('@yylo/cli');
+    const assetsSha256 = managedAssetRecordsIdentity(inventory.assets);
+    expect(inventory.instructionBundle.assetsSha256).toBe(assetsSha256);
+    const identityCore = {
+      schemaVersion: inventory.instructionBundle.schemaVersion,
+      semanticVersion: inventory.instructionBundle.semanticVersion,
+      packageVersion: inventory.instructionBundle.packageVersion,
+      assetCount: inventory.instructionBundle.assetCount,
+      assetsSha256,
+    };
+    expect(inventory.instructionBundle.bundleSha256).toBe(
+      sha256(JSON.stringify(identityCore)),
+    );
     for (const [destination, identity] of Object.entries(
       inventory.assets as Record<string, { sourceSha256: string; installedSha256: string }>,
     )) {
@@ -190,6 +279,19 @@ describe('ManagedProjectAssets', {
     const report = await ManagedProjectAssets.inspectGeneration(projectDir);
     expect(report.coherent).toBe(true);
     expect(report.instructionBundle?.schemaVersion).toBe('juno_instruction_bundle.v1');
+  });
+
+  it('uses canonical UTF-8 ordering and encoding for managed record identity', () => {
+    const keys = ['😀', 'a', '.dot', 'é', 'A', '_under'];
+    const assets = Object.fromEntries(keys.map((destination, index) => [destination, {
+      type: 'script',
+      templateVersion: '1.2.3',
+      sourceSha256: String(index + 1).repeat(64),
+      installedSha256: String(index + 1).repeat(64),
+    }]));
+    expect(managedAssetRecordsIdentity(assets)).toBe(
+      'd965b07f2505b7a1c7c7c5dfb8151409191fc8dfa37b81b4bc9ec9a2db4c6f82',
+    );
   });
 
   it('writes one complete semantic instruction-bundle identity on fresh install', async () => {
@@ -361,7 +463,9 @@ describe('ManagedProjectAssets', {
     ).toContain('Controller commits never merge or synchronize into a product target');
     expect(reviewPrompt).toContain('Never use bare `pi`');
     expect(reviewPrompt).toContain('Review only');
-    expect(reviewPrompt).toContain('do not edit, commit, update Kanban, launch another reviewer');
+    expect(reviewPrompt).toContain(
+      'do not edit, commit, update Kanban, create advisory tasks, launch another reviewer',
+    );
     expect(reviewPrompt).toContain('Return PASS only after reviewing the complete frozen candidate');
     expect(reviewPrompt).toContain('Return every independently actionable admitted defect');
     expect(reviewPrompt).toContain('Do not downgrade an out-of-scope idea');
@@ -630,6 +734,10 @@ describe('ManagedProjectAssets', {
       type: string;
     }>;
 
+    // This fixture exercises the package's own dogfood policy and Python suite.
+    await fs.outputJson(path.join(projectDir, 'juno-code/package.json'), {
+      name: '@yylo/cli', version: '0.0.0-test',
+    });
     await ManagedProjectAssets.update(projectDir, { silent: true });
     await ScriptInstaller.autoUpdate(projectDir, true);
 
