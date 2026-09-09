@@ -10,6 +10,7 @@ import { checkpointControllerAfterFinalization } from '../../utils/controller-ch
 export type TaskWorkspaceOperation =
   | 'start'
   | 'run'
+  | 'resume'
   | 'recover-predispatch'
   | 'recover-wall-budget'
   | 'status'
@@ -186,6 +187,11 @@ export function configureTaskWorkspaceCommand(
     .argument('<task-id>', 'Canonical YYLO Ledger task ID')
     .action((taskId: string) => invoke('run', taskId, []));
   task
+    .command('resume')
+    .description('Resume through the existing fenced task-run owner from the earliest verified stage')
+    .argument('<task-id>', 'Canonical YYLO Ledger task ID')
+    .action((taskId: string) => invoke('resume', taskId, []));
+  task
     .command('recover-predispatch')
     .description('Release one receipt-proven no-provider task-run attempt without spending model budget')
     .argument('<task-id>', 'Canonical YYLO Ledger task ID')
@@ -257,9 +263,11 @@ export function configureTaskWorkspaceCommand(
       'hydrate', taskId, [], options.leaseToken ? ['--lease-token', options.leaseToken] : [],
     ));
   task.command('status')
+    .description('Read-only state, producer fence, prior terminal evidence, and one eligible action')
     .argument('<task-id>', 'Canonical YYLO Ledger task ID')
     .action((taskId: string) => invoke('status', taskId, []));
   task.command('finish')
+    .description('Queue only after live state/fence admission and exact reusable validation')
     .argument('<task-id>', 'Canonical YYLO Ledger task ID')
     .option('--lease-token <token>', 'Current fencing lease token for this gated mutation')
     .action((taskId: string, options: { leaseToken?: string }) => invoke(

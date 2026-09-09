@@ -2231,6 +2231,10 @@ class MergeQueueTests(unittest.TestCase):
     def test_target_arbiter_stays_absent_for_idle_queue_and_status_is_read_only(self) -> None:
         observed = merge_runtime.target_arbiter_status(self.controller.resolve())
         self.assertEqual(observed["reason_code"], "queue_idle")
+        self.assertEqual(observed["resume_decision"]["classification"],
+                         task_runtime.decisions.RESUME_LAUNCH_NOT_STARTED)
+        self.assertEqual(observed["resume_decision"]["owner_command"],
+                         "yy merge arbiter run")
         self.assertEqual(observed["eligible_task_ids"], [])
         projection = merge_runtime.merge_drive(self.controller.resolve())
         self.assertEqual(projection["outcome"], "IDLE")
@@ -2242,6 +2246,8 @@ class MergeQueueTests(unittest.TestCase):
     def test_target_arbiter_cli_uses_status_and_drive_control_audits(self) -> None:
         observed = json.loads(self.command(QUEUE, ["arbiter", "status"]).stdout)
         driven = json.loads(self.command(QUEUE, ["arbiter", "run"]).stdout)
+        parsed = merge_runtime.parser().parse_args(["resume", "--through", "X"])
+        self.assertEqual((parsed.operation, parsed.through), ("resume", "X"))
 
         self.assertEqual(observed["reason_code"], "queue_idle")
         self.assertEqual(driven["outcome"], "IDLE")
@@ -2981,6 +2987,25 @@ steps:
         self.assertTrue(evidence["suite_cancelled"])
         self.assertEqual(evidence["reason"], "blocking_reviewer_a")
 
+    def test_ineligible_explicit_mutations_refuse_before_plan_runtime_or_recovery(self) -> None:
+        state = task_runtime.read_state(self.controller)
+        state["tasks"]["X"] = {"task_id": "X", "state": "MERGED",
+                               "target_ref": "refs/heads/product"}
+        task_runtime.write_state(self.controller, state)
+        with mock.patch.object(merge_runtime, "assert_static_plan",
+                               side_effect=AssertionError("plan must not run")):
+            with self.assertRaisesRegex(merge_runtime.MergeQueueError,
+                                        "no bound CONFLICT"):
+                merge_runtime.merge_resolve(self.controller.resolve(), "X")
+            with self.assertRaisesRegex(merge_runtime.MergeQueueError,
+                                        "no review findings"):
+                merge_runtime.merge_reopen(self.controller.resolve(), "X")
+        with mock.patch.object(task_runtime, "load_config",
+                               side_effect=AssertionError("runtime must not run")):
+            with self.assertRaisesRegex(merge_runtime.MergeQueueError,
+                                        "not awaiting risk"):
+                merge_runtime.merge_next(self.controller.resolve(), "X")
+
     def test_merge_status_returns_a_durable_controller_audit_receipt(self) -> None:
         result = self.queue_payload("status")
         reference = result["control_audit"]
@@ -3026,6 +3051,13 @@ steps:
         self.assertLessEqual(len(summary["recent_transitions"]),
                              merge_runtime.MERGE_STATUS_SUMMARY_ROWS)
         self.assertEqual(summary["blockers"][0]["task_id"], "X")
+        blocker = summary["blockers"][0]
+        self.assertEqual(blocker["mutation_eligibility"]["operation"], "resolve")
+        self.assertTrue(blocker["mutation_eligibility"]["eligible"])
+        self.assertEqual(blocker["mutation_eligibility"]["safe_next_action"],
+                         "yy merge resolve X")
+        self.assertIn("producer_status", blocker["producer_fence"])
+        self.assertIn("prior_terminal_evidence", blocker)
         self.assertEqual(summary["next_action"], "yy merge resolve X")
         self.assertNotIn("post_integration", encoded.decode())
         cli = self.command(QUEUE, ["status"])
@@ -3056,6 +3088,11 @@ steps:
         self.assertTrue(detail["projection"]["truncated"])
         self.assertIn("record_revision", detail["task"])
         self.assertIn("post_integration", detail["task"])
+        self.assertEqual(detail["task"]["phase_timing"], {
+            "schema_version": "juno_lifecycle_phase_timing.v1",
+            "resource_wait_ms": 0, "execution_ms": 0, "settlement_ms": 0,
+            "overall_elapsed_ms": 0, "first_failure_ms": None,
+        })
         self.assertLessEqual(len((merge_runtime.canonical(detail) + "\n").encode()),
                              merge_runtime.MERGE_STATUS_MAX_BYTES)
 
