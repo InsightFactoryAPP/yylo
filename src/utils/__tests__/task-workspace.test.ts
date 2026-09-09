@@ -59,7 +59,30 @@ describe('Bolt task workspace managed runtime', () => {
       );
       expect(installer?.argv).toContain('src/utils/__tests__/script-installer.test.ts');
       expect(integration?.argv).toContain('src/utils/__tests__/integration-workspace.test.ts');
+      expect(installer?.argv).toContain('--no-cache');
+      expect(integration?.argv).toContain('--no-cache');
     }
+  });
+
+  it('admits the bootstrapped yylo-skills gitlink as a selectable exact root', () => {
+    for (const policyPath of [
+      resolve(repository, '.juno_task/config/task-workspace.json'),
+      resolve(repository, 'juno-code/src/templates/config/task-workspace.json'),
+    ]) {
+      const policy = JSON.parse(readFileSync(policyPath, 'utf8')) as {
+        allowed_paths: string[];
+        selectable_paths: string[];
+      };
+      expect(policy.allowed_paths).not.toContain('yylo-skills');
+      expect(policy.selectable_paths).toEqual(['frontend', 'juno_kanban', 'yylo-skills']);
+    }
+
+    const runtime = readFileSync(
+      resolve(repository, 'juno-code/src/templates/scripts/task_workspace.py'),
+      'utf8',
+    );
+    expect(runtime).toContain('initialize_selected_gitlinks(worktree, selected_entries)');
+    expect(runtime).toContain('selected gitlink was not initialized at the target object');
   });
 
   it('routes benchmark changes through test, typecheck, and build', () => {
@@ -125,12 +148,10 @@ describe('Bolt task workspace managed runtime', () => {
       '.juno_task/scripts/install_requirements.sh',
       '.juno_task/scripts/invocation_correlation.py',
       '.juno_task/scripts/release_gate.py',
-      '.juno_task/scripts/release_train.py',
       '.juno_task/scripts/target_runtime_provenance.py',
       '.juno_task/scripts/task_workflow_helper.py',
       '.juno_task/scripts/task_workspace_decisions.py',
       '.juno_task/scripts/tests/test_task_workspace_decisions.py',
-      '.juno_task/scripts/tests/test_release_train.py',
       '.juno_task/scripts/tests/test_risk_policy.py',
       '.juno_task/scripts/wiki_lint.py',
       '.juno_task/scripts/worktree_hydration.py',

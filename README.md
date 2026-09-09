@@ -37,7 +37,7 @@ yy --help
 
 ### Stable and prerelease channels
 
-The stable npm channel is `@latest` (`0.2.0` when this README was audited). The current prerelease is on `@next` (`0.2.1-rc.14`), not `latest`:
+The stable npm channel is `@latest` (`0.2.2`). Prereleases remain on `@next`:
 
 ```bash
 # Stable
@@ -45,8 +45,8 @@ npm install --global '@yylo/cli@latest'
 
 # Explicit prerelease
 npm install --global '@yylo/cli@next'
-# Exact prerelease for reproducible installs
-npm install -g @yylo/cli@0.2.1-rc.14
+# Exact version for reproducible installs
+npm install -g @yylo/cli@0.2.2
 
 npm view '@yylo/cli' version dist-tags --json
 yy --version
@@ -68,7 +68,7 @@ Next: [run an agent](#beginner-agent-workflow), [manage a typed task](#typed-tas
 | Repository topology | `info`, `where`, `doctor workspace`, `integration` | Read-only discovery is separate from guarded sync/repair/push. |
 | Feature lifecycle | `task start|run|status|checkpoint|preflight|finish` | Implementation belongs in the returned exact-base task worktree. |
 | Protected delivery | `merge status|plan|arbiter|drive|next|resolve` | One fenced target owner and expected-old-SHA CAS; dirt is preserved. |
-| Release epoch | `release train ...` | Readiness only; tag, publish, push, deploy, and cleanup need separate authority. |
+| Maintainer release | repository `scripts/release-cli.sh` | Prepare is read-only; publish needs separate authority. |
 | Records/evaluation | `ledger`, `benchmark` | Transparent delegation to independently installed canonical packages. |
 
 Run `yy --help` for the complete top-level inventory of your installed version; each listed command prints its own usage when invoked with `-h`. The old `lifecycle` command is removed; use typed `task` and `merge` commands.
@@ -259,7 +259,9 @@ yy task start TASK_ID
 # Read its AGENTS.md/CLAUDE.md, implement, run focused tests, and commit.
 yy task preflight TASK_ID
 yy task finish TASK_ID
-yy merge status
+yy merge status                       # bounded operational summary
+yy merge status --detail TASK_ID      # bounded task diagnostics
+yy merge status --full                # explicit legacy exhaustive output
 yy merge arbiter status
 yy merge arbiter run --through TASK_ID
 ```
@@ -282,26 +284,40 @@ yy task status TASK_ID
 yy task doctor TASK_ID
 yy merge plan TASK_ID --json
 yy merge status
+# When needed:
+yy merge status --detail TASK_ID
+yy merge status --detail              # active FIFO attempt
+yy merge status --full                # exhaustive compatibility/diagnosis
 yy merge arbiter status
 ```
 
+Bare status is `merge-status.summary.v1`, capped at 32 KiB and 19 projected rows.
+Detail remains capped at 32 KiB and identifies omitted diagnostic material;
+`--full` is the unbounded `merge-status.full.v1` compatibility projection. JSON
+always includes schema, projection, truncation, and cursor metadata. Interactive
+status renders those same identifiers; pass `--json` to force structured output.
+
 `yy merge next` and `yy merge resolve` are explicit recovery mutations, not polling commands.
 
-## Sealed release epochs
+## Maintainer npm release
 
-A release wave can freeze all eligible pre-cutoff candidates, compose one private history-preserving train, run aggregate evidence once, and advance the protected target with one expected-old-SHA CAS.
+Normal tasks and `yy merge` own integration. After an ordinary version bump is integrated, maintainers use `scripts/release-cli.sh prepare CLI_VERSION BENCHMARK_VERSION`, obtain explicit publication approval, and then run the separate `publish` command. The CLI has no release command.
+
+## Receipt-bound workspace relocation
+
+When an entire controller is moved between machines, do not rewrite lifecycle JSON or historical receipts by hand. From a clean physical controller checkout, create and review an external plan, apply it once, then verify its immutable receipt:
 
 ```bash
-yy release train inspect /absolute/path/to/train.json --json
-yy release train seal /absolute/path/to/train.json --json
-# Retain the epoch ID and one-time token returned by seal.
-yy release train drive EPOCH_ID --epoch-token TOKEN --json
-yy release train epoch-status EPOCH_ID --json
+node juno-code/scripts/workspace-relocation.mjs plan --controller "$PWD" \
+  --map /old/controller=/new/controller --map /old/worktrees=/new/worktrees \
+  --output /secure/relocation-plan.json
+node juno-code/scripts/workspace-relocation.mjs apply --controller "$PWD" \
+  --plan /secure/relocation-plan.json --receipt /secure/relocation-receipt.json
+node juno-code/scripts/workspace-relocation.mjs verify --controller "$PWD" \
+  --receipt /secure/relocation-receipt.json
 ```
 
-The declaration path, `EPOCH_ID`, and `TOKEN` are placeholders. `inspect`, `plan`, `status`, `epoch-status`, and `shadow` are observations. `seal`, `drive`, `eject`, `repair`, and `retry` are fenced mutations with command-specific authority.
-
-A successful epoch emits read-only release readiness after target CAS and member reconciliation. It does **not** authorize an RC, tag, push, npm/PyPI publication, deployment, production mutation, or worktree cleanup. Those remain separate explicit actions.
+The plan binds the Git common directory, HEAD/ref, task-state hash, exact JSON pointers, and old/new physical roots. Apply refuses dirty, stale, tampered, symlinked, replayed, or missing-commit inputs and preserves historical evidence. Scan shipped active surfaces separately with `node juno-code/scripts/check-path-portability.mjs`; fixtures, immutable receipts, logs, generated output, lockfiles, and security canaries are explicitly excluded rather than rewritten.
 
 ## Workspace roles and recovery
 
@@ -372,7 +388,7 @@ juno-kanban-juno-002 --version
 ./juno-code/scripts/juno-002-source-toolchain.sh status
 ```
 
-Both aliases enforce the exact Ledger compatibility policy `>=2.0.5,<3.0.0`. Source selection, controller registration, and data history are separate boundaries:
+`yy ledger` and its labelled `yy kanban` compatibility alias use the exact Ledger compatibility policy `0.2.0`. The isolated source aliases also enforce the legacy controller package compatibility range `juno-kanban >=2.0.5,<3.0.0`. Source selection, controller registration, and data history are separate boundaries:
 
 ```bash
 ./juno-code/scripts/juno-002-source-toolchain.sh register-controller /path/to/controller controller-branch

@@ -1,6 +1,6 @@
 ---
 wiki_contract:
-  line_limit: 260
+  line_limit: 320
   purpose: "Run exact-base task worktrees and one fenced per-target delivery owner."
   failure_mode_prevented: "Controller edits, stale-worker takeover, model polling, and unsafe target movement."
   runtime_contract_enforced: "yy task owns feature worktrees; one yy merge arbiter owns composition and expected-old-SHA CAS."
@@ -8,7 +8,6 @@ wiki_contract:
   related_sots:
     - "controller/fenced_task_leases.md"
     - "controller/target_arbiter.md"
-    - "controller/sealed_release_epochs.md"
 ---
 
 # Bolt task worktrees and merge queue
@@ -32,9 +31,10 @@ metadata controller
 ## Public commands
 
 ```text
-yy task start TASK_ID                    # baseline/default paths (including juno-code)
-yy task start TASK_ID --path juno_kanban  # add a selectable root; repeat for more
+yy task start TASK_ID                    # omit --path only for legacy baseline admission
+yy task start TASK_ID --path exact/file   # repeat exact files; policy trees also supported
 yy task status TASK_ID
+yy task admission TASK_ID                # read-only dirty/committed scope gate
 yy task preflight TASK_ID
 yy task checkpoint TASK_ID
 yy task finish TASK_ID
@@ -47,19 +47,39 @@ yy task runtime-bootstrap --dry-run
 # review the printed immutable receipt
 yy task runtime-bootstrap --apply RECEIPT
 
-yy merge status                 # read-only queue observation
+yy merge status                 # bounded read-only summary (32 KiB / 19 rows maximum)
+yy merge status --detail TASK_ID # bounded selected-task diagnostic projection
+yy merge status --detail        # bounded active FIFO-attempt projection
+yy merge status --full          # explicit legacy exhaustive representation
 yy merge arbiter status         # read-only owner/next-action observation
 yy merge arbiter run            # explicit fenced on-demand mutation
 yy merge drive --through TASK_ID # explicit typed mutation
 yy merge next                   # explicit single-step recovery
 yy merge resolve TASK_ID        # explicit preserved-conflict recovery
+yy merge recover-authority-drift TASK_ID --attempt N \
+  --terminal-receipt /canonical/attempt-N-failed.json \
+  --terminal-receipt-sha256 SHA256 --expected-revision RECORD_SHA256
 ```
 
-Task start always admits the policy's baseline/default paths and freezes the
-exact configured product target SHA. Omit `--path` for ordinary Juno Code work;
-`juno-code` is already in baseline scope and is not a selectable value. Use
-repeatable `--path` only to add roots listed by the policy's `selectable_paths`,
-such as `juno_kanban` or `frontend`. Task start then creates one branch/worktree.
+`recover-authority-drift` is the only editable recovery for a preserved `MERGING`
+incident that failed deterministically at `before_target_cas`. Read `record_revision`
+from `yy merge status --detail TASK_ID` and the exact attempt/terminal receipt identity from
+`yy merge arbiter status`, then run the command once. It requires a dead producer,
+exact clean source and candidate worktrees, unchanged source/candidate/target
+identities, and positive no-CAS proof. It atomically retains the failed queue
+attempt and candidate as evidence while issuing a fresh fenced `WORKING` lease.
+The safe next step is one descendant repair commit followed by
+`yy task preflight TASK_ID`, using the returned lease token for later fenced
+mutations. It distinctly refuses reviews, conflicts, post-CAS state, live
+ownership, dirty or ambiguous worktrees, identity/revision drift, malformed
+evidence, and repeated recovery. It never validates, reviews, composes, launches
+a worker, cleans a candidate, or changes the protected target. Do not use
+`yy merge next` to repeat the unchanged deterministic attempt.
+
+Task start freezes the exact target SHA. Omitting `--path` retains the legacy
+baseline envelope. Repeated tracked files freeze only those exact files plus
+declared generated destinations; explicitly selected policy trees remain
+supported, but exact-file requests never silently inherit baseline roots.
 Before editing or testing there, the worker follows [task dependency hydration](task_dependency_hydration.md)
 for each configured validation cwd and stops on provisioning or clean-tree
 failure. Runtime identity is validated before any Juno-specific generated-output
@@ -109,7 +129,9 @@ receipts, package mismatch, non-older inventory generations, and consumer target
 customization without exact managed-inventory provenance also refuse.
 
 One on-demand target arbiter serializes mutation with a fencing token, per-target
-kernel lock, and expected-old-SHA update, then exits when idle or blocked. Lease
+kernel lock, and expected-old-SHA update, then exits when idle or blocked.
+All task/merge consumers use `juno_path_origin_projection.v1` from complete Git
+blob maps: altered inherited bytes are authored and ambiguity fails closed. Lease
 age alone never transfers ownership: successor attempts require controller proof
 of producer death or explicit handoff. Agents observe rather than poll. Dirty
 conflict bytes are preserved for one bounded managed repair. Exact complete-input
@@ -122,10 +144,24 @@ candidate and one delta review group; another material
 finding stops as `REVIEW_FINDINGS_EXHAUSTED` instead of spawning an autonomous
 loop. A changed product candidate invalidates prior semantic evidence, while a
 byte-identical metadata/harness retry may reuse evidence only when all bound
-policy/runtime/closure identities remain exact. After CAS, only deterministic identity/readback and bounded smoke checks run.
-Release waves close admission explicitly and compose every eligible pre-cutoff
-candidate into one private history-preserving epoch; one aggregate gate and one
-protected-target CAS produce read-only release readiness.
+policy/runtime/closure identities remain exact. A repeated deterministic
+`FAILED_FULL_SUITE` is never rerun unchanged. `yy merge status --detail TASK_ID` returns
+`deterministic_full_suite_repair_available` and one exact
+`yy merge recover-full-suite-failure TASK ...` command binding the lifecycle
+journal/revision, failed suite and finding, candidate/tree, target, producer, and
+predecessor arbiter. Bare status is the `merge-status.summary.v1` projection and
+never constructs exhaustive attempt payloads; detail is `merge-status.detail.v1`,
+and only `--full` returns `merge-status.full.v1` legacy fields. JSON projections
+always declare their level, byte/row limits, truncation, and cursor. Interactive
+output prints the same projection identifier and truncation/cursor truth; use
+`--json` to force structured output in a terminal. That transition authorizes the existing queue-owned single
+repair worker; only the failing router contract and its exact CLI/router
+counterparts may change. The repaired delta runs focused validation before the
+required policy suite and one delta review group. Any environmental failure,
+live producer, moved identity, unrelated delta, malformed receipt, post-CAS
+state, or spent repair/delta budget refuses without mutation. If existing `semantic-repair-0001` passes create/verify/edit preflight but is refused before provider launch, `yy merge status --detail TASK_ID` exposes the only supported `recover-repair-predispatch` command.
+It binds failed arbiter, lifecycle revision/run/scope/journal, candidate/tree/target, repair authorization, exact worker path, all admission-receipt digests, no-provider receipt, and clean controller commit/tree; its immutable projection proves no provider launch/model cost, preserves worker/receipts, keeps `repair_count=1`, and makes only that worker eligible for typed safe next `yy merge arbiter run --through TASK_ID`.
+Live producer, launch/terminal evidence, dirt, moved identity, altered worker, missing receipt, repeat, exhausted delta budget, conflict, or post-CAS state refuses without mutation; generic task pre-dispatch recovery does not own REVIEW_FINDINGS merge journals. After CAS, only deterministic identity/readback and bounded smoke checks run.
 
 Cleanup refuses unless the delivered commit is reachable and the task worktree
 is safe to remove. Push, release, publication, deployment, production mutation,
@@ -133,7 +169,6 @@ restart, and post-deploy E2E are never implied by merge completion.
 
 Historical local-integration receipts remain readable by Workflow Runner doctor.
 Their executors are retired and must not be adapted into the Bolt path.
-
 ## Umbrella-owned sequential children
 
 Approved consolidated delivery may admit one umbrella worktree that executes
@@ -201,6 +236,37 @@ the receipt under the target lock, advances only the bound owner and role base,
 hydrates with `--no-fetch`, and requires an exact clean final readback. Any other
 finding, dirt, topology change, unavailable object, authority mismatch, or ref
 drift refuses; this is not a generic blocker bypass.
+
+## Receipt-bound stale lifecycle supersession
+
+A managed merge-drive journal that remains nonterminal after its in-flight task
+was receipt-recovered and requeued must not be deleted or have its prior events
+rewritten. Use `yy merge supersede-lifecycle-journal` only with the exact run,
+journal revision and byte digest, frozen scope, terminal failed-arbiter receipt,
+recovered task receipt, unchanged target SHA, and current actionable FIFO digest.
+The operation requires a dead producer, a proven pre-CAS lineage, and a current
+FIFO that differs from the frozen one. It appends one immutable `SUPERSEDED`
+projection and deterministic summary, preserves queue rows byte-for-byte, and is
+idempotent for the same complete binding. Live producers, valid current scopes,
+missing recovery lineage, target drift, post-CAS evidence, malformed artifacts,
+and changed revisions refuse with distinct reason codes.
+
+The command output names `yy merge arbiter run` as the only safe next action. A
+fresh compiler then selects current FIFO normally; supersession grants no queue
+reorder, candidate deletion, target CAS, release, push, deploy, or cleanup
+authority. Obtain `current_fifo.sha256` from the candidate runtime's read-only
+`arbiter status` projection and never improvise identities or edit evidence:
+
+```bash
+python3 "$CANDIDATE/.juno_task/scripts/merge_queue.py" --controller "$CONTROLLER" arbiter status
+python3 "$CANDIDATE/.juno_task/scripts/merge_queue.py" --controller "$CONTROLLER" supersede-lifecycle-journal \
+  --run-id "$RUN_ID" --expected-journal-revision "$REVISION" \
+  --expected-journal-sha256 "$JOURNAL_SHA256" --scope-sha256 "$SCOPE_SHA256" \
+  --arbiter-attempt "$ARBITER_ATTEMPT" --terminal-receipt "$FAILED_RECEIPT" \
+  --terminal-receipt-sha256 "$FAILED_RECEIPT_SHA256" --recovered-task "$TASK_ID" \
+  --recovery-receipt "$RECOVERY_RECEIPT" --recovery-receipt-sha256 "$RECOVERY_SHA256" \
+  --expected-target-sha "$TARGET_SHA" --expected-current-fifo-sha256 "$FIFO_SHA256"
+```
 
 ## Integration owner lifecycle
 

@@ -109,7 +109,6 @@ LIFECYCLE_BOARD_STATUS = {
     KANBAN_SYNC_STATE: "in_progress",
     "QUEUED": "in_progress",
     "AWAITING_RISK": "in_progress",
-    "AWAITING_RELEASE": "in_progress",
     "REVIEWING": "in_progress",
     "RISK_EVIDENCE_READY": "in_progress",
     "CONFLICT": "in_progress",
@@ -135,8 +134,10 @@ VALIDATION_PHASES = ("WAITING_FOR_RESOURCE", "SETUP", "RUNNING", "TEARDOWN")
 VALIDATION_TERMINALS = {"PASSED", "FAILED", "TIMED_OUT", "INTERRUPTED", "SETUP_FAILED"}
 STANDING_EVIDENCE_SCHEMA = "juno_standing_validation_evidence.v1"
 CANONICAL_VALIDATION_RECEIPT_SCHEMA = "juno_canonical_validation_receipt.v1"
+CANONICAL_VALIDATION_ROOT = ".juno_task/runtime/validation-receipts"
 STANDING_PLAN_SCHEMA = "juno_standing_validation_plan.v1"
 STANDING_ROOT = ".juno_task/runtime/standing-evidence"
+SUBMISSION_ROOT = ".juno_task/runtime/task-submissions"
 
 
 class TaskWorkspaceError(RuntimeError):
@@ -450,9 +451,15 @@ def load_config(controller: Path) -> dict[str, Any]:
         raise TaskWorkspaceError("target_ref must be a full local branch ref")
     if not isinstance(prefix, str) or not prefix.startswith("refs/heads/") or not prefix.endswith("-"):
         raise TaskWorkspaceError("branch_prefix must be a full local branch prefix ending in '-'")
-    workspace = Path(value["workspace_root"]).expanduser()
+    configured_workspace = value["workspace_root"]
+    if configured_workspace == "@state/yylo/task-worktrees":
+        state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")).expanduser()
+        workspace = state_home / "yylo/task-worktrees"
+        value["workspace_root"] = str(workspace)
+    else:
+        workspace = Path(configured_workspace).expanduser()
     if not workspace.is_absolute() or workspace == Path("/"):
-        raise TaskWorkspaceError("workspace_root must be an explicit absolute directory")
+        raise TaskWorkspaceError("workspace_root must be an explicit absolute directory or @state/yylo/task-worktrees")
     for field in ("allowed_paths", "selectable_paths", "controller_private_paths"):
         items = value[field]
         if not isinstance(items, list) or (field != "selectable_paths" and not items):
@@ -749,6 +756,27 @@ def compatible_task_revision(controller: Path, task_id: str, body: bytes,
         if hashlib.sha256(historical).hexdigest() == expected_sha256:
             return immutable_task_body(historical) == immutable_task_body(body)
     return False
+
+
+def canonical_requirement_identity(controller: Path, task_id: str) -> dict[str, Any]:
+    """Bind authored task requirements and every explicitly linked controller PDR."""
+    _path, body = task_manifest(controller, task_id)
+    immutable = immutable_task_body(body)
+    text = immutable.decode("utf-8", errors="replace")
+    pdr_paths = sorted(set(re.findall(
+        r"\.juno_task/specs/[A-Za-z0-9][A-Za-z0-9._/-]*\.md", text)))
+    pdrs: dict[str, str] = {}
+    for relative in pdr_paths:
+        path = (controller / relative).resolve()
+        try:
+            path.relative_to(controller.resolve())
+            pdrs[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (ValueError, OSError) as exc:
+            raise TaskWorkspaceError(
+                f"canonical task requirement PDR is missing or unsafe: {relative}") from exc
+    material = {"task_requirements_sha256": hashlib.sha256(immutable).hexdigest(),
+                "pdr_revisions": pdrs}
+    return {**material, "requirements_sha256": stable_sha256(material)}
 
 
 def load_task_scope(controller: Path, task_id: str, body: bytes) -> tuple[dict[str, Any], str]:
@@ -1440,16 +1468,45 @@ def derived_output_admission(repository: Path, target_sha: str,
 MANAGED_ASSETS_TEMPLATE_ROOT = "juno-code/src/templates/"
 
 
+def path_origin_projection(repository: Path, base_sha: str, source_sha: str,
+                           target_sha: str, candidate_sha: Optional[str],
+                           admitted_paths: list[str], generated_admission: Any,
+                           conflict_paths: Optional[list[str]] = None) -> dict[str, Any]:
+    """Git adapter for the canonical pure blob-origin projection."""
+    candidate_sha = candidate_sha or source_sha
+    for label, sha in (("base", base_sha), ("source", source_sha),
+                       ("target", target_sha), ("candidate", candidate_sha)):
+        if (not isinstance(sha, str) or not SHA_RE.fullmatch(sha)
+                or run(["git", "-C", str(repository), "cat-file", "-e", f"{sha}^{{commit}}"],
+                       repository, check=False).returncode):
+            raise TaskWorkspaceError(f"path origin {label} object is missing or forged")
+    bindings = (generated_admission.get("bindings", [])
+                if isinstance(generated_admission, dict) else [])
+    return decisions.project_path_origins(
+        base_tree=_tip_tree_blobs(repository, base_sha),
+        source_tree=_tip_tree_blobs(repository, source_sha),
+        target_tree=_tip_tree_blobs(repository, target_sha),
+        candidate_tree=_tip_tree_blobs(repository, candidate_sha),
+        admitted_paths=admitted_paths, generated_bindings=bindings,
+        conflict_paths=conflict_paths or [])
+
+
 def _tip_tree_blobs(repository: Path, tip_sha: str) -> dict[str, str]:
-    """Map every tracked blob path to its object ID at one exact commit."""
-    output = git(repository, "ls-tree", "-r", tip_sha, check=False)
+    """Map every tracked blob path using NUL framing (never quoted path text)."""
+    result = run(["git", "-C", str(repository), "ls-tree", "-rz", tip_sha],
+                 repository, check=False)
+    if result.returncode:
+        raise TaskWorkspaceError("path origin tree object is unreadable")
+    output = result.stdout
     blobs: dict[str, str] = {}
-    for line in output.splitlines():
-        metadata, separator, path = line.partition("\t")
-        if not separator:
+    for entry in output.split("\0"):
+        if not entry:
             continue
+        metadata, separator, path = entry.partition("\t")
+        if not separator:
+            raise TaskWorkspaceError("path origin tree entry is malformed")
         mode, kind, object_id = metadata.split()
-        if kind == "blob":
+        if kind in {"blob", "commit"}:
             blobs[path] = object_id
     return blobs
 
@@ -1698,26 +1755,28 @@ def require_full_task_materialization(worktree: Path, target_sha: str,
 
 def selected_task_paths(config: dict[str, Any], repository: Path, target_sha: str,
                         requested: list[str]) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """Resolve explicit roots or exact tracked files without implicit broadening."""
     normalized = [normalized_relative(item, "required task path") for item in requested]
     if len(set(normalized)) != len(normalized):
         raise TaskWorkspaceError("required task paths contain duplicates")
-    unknown = [item for item in normalized if item not in config["selectable_paths"]]
-    if unknown:
-        raise TaskWorkspaceError(
-            f"required task path is not admitted by policy: {', '.join(unknown)}"
-        )
     entries: dict[str, dict[str, str]] = {}
     for item in normalized:
+        selectable = item in config["selectable_paths"]
+        if not selectable and not path_within(item, config["allowed_paths"]):
+            raise TaskWorkspaceError(f"required task path is not admitted by policy: {item}")
         output = git(repository, "ls-tree", target_sha, "--", item, check=False)
         lines = [line for line in output.splitlines() if line]
         if len(lines) != 1:
             raise TaskWorkspaceError(f"required task path is absent or ambiguous at target: {item}")
         metadata, actual_path = lines[0].split("\t", 1)
         mode, kind, object_id = metadata.split()
-        if actual_path != item or mode not in {"040000", "160000"} or kind not in {"tree", "commit"}:
+        safe = ((selectable and mode in {"040000", "160000"} and kind in {"tree", "commit"})
+                or (not selectable and mode in {"100644", "100755"} and kind == "blob"))
+        if actual_path != item or not safe:
             raise TaskWorkspaceError(f"required task path has an unsafe target identity: {item}")
         entries[item] = {"mode": mode, "type": kind, "object": object_id}
-    return [*config["allowed_paths"], *normalized], entries
+    exact_mode = any(item not in config["selectable_paths"] for item in normalized)
+    return (normalized if exact_mode else [*config["allowed_paths"], *normalized]), entries
 
 
 def canonical_child_scope(controller: Path, repository: Path, base_sha: str, child_id: str,
@@ -2260,16 +2319,16 @@ def record_control_audit(controller: Path, surface: str, operation: str,
                          task_id: Optional[str] = None) -> dict[str, str]:
     routing = routing_identity(controller)
     forwarded_policy = routing.get("policy_operation")
-    expected_policy = ("kanban" if operation in {"status", "preflight", "recovery-plan", "contract", "handoff", "evidence-status", "doctor", "lease-status"}
+    expected_policy = ("kanban" if operation in {"status", "admission", "preflight", "recovery-plan", "evidence-status", "doctor", "lease-status"}
                        else "orchestration")
     if surface == "task" and operation not in {
-            "start", "run", "recover-predispatch", "recover-wall-budget", "status", "hydrate", "preflight", "finish", "contract", "handoff",
+            "start", "run", "recover-predispatch", "recover-wall-budget", "status", "admission", "hydrate", "preflight", "finish",
             "checkpoint", "child-checkpoint", "evidence-run", "evidence-status", "evidence-await",
             "recovery-plan", "recovery-authorize", "recovery-apply", "sync", "doctor",
             "lease-status", "lease-heartbeat", "lease-handoff", "lease-successor",
             "lease-revoke", "lease-release"}:
         raise TaskWorkspaceError(f"unsupported task audit operation: {operation}")
-    if surface == "merge" and operation not in {"status", "drive", "next", "resolve", "review", "reopen", "reconcile", "refresh", "withdraw"}:
+    if surface == "merge" and operation not in {"status", "drive", "next", "resolve", "review", "reopen", "reconcile", "refresh", "withdraw", "recover-full-suite-failure", "recover-repair-predispatch", "recover-authority-drift", "supersede-lifecycle-journal"}:
         raise TaskWorkspaceError(f"unsupported merge audit operation: {operation}")
     if forwarded_policy is not None and forwarded_policy != expected_policy:
         raise TaskWorkspaceError(
@@ -2421,13 +2480,17 @@ def _hydration_manifest_evidence(run_dir: Path) -> dict[str, Optional[str]]:
     }
 
 
+MUTABLE_DEPENDENCY_CACHE_PATHS = frozenset({".vite/vitest/results.json"})
+
+
 def _dependency_content_manifest(worktree: Path, config: dict[str, Any]) -> dict[str, str]:
-    """Content-address every installed dependency file per configured lock cwd.
+    """Content-address every behavior-relevant dependency file per lock cwd.
 
     npm metadata validation cannot detect tampered or corrupted installed
-    bytes, so hydration records a byte manifest of every regular file and
-    symlink under each lock cwd's node_modules. The manifest is stored as a
-    controller-side artifact and verified before any worker budget is spent.
+    bytes, so hydration records regular files and symlinks under each lock
+    cwd's node_modules. Explicit test-run caches are excluded because they are
+    outputs, not command inputs. The controller-side manifest is verified
+    before any worker budget is spent.
     """
     manifest: dict[str, str] = {}
     rows = [*config["focused_validation"], config["full_suite_validation"]]
@@ -2445,6 +2508,9 @@ def _dependency_content_manifest(worktree: Path, config: dict[str, Any]) -> dict
         if not node_modules.is_dir():
             continue
         for path in sorted(node_modules.rglob("*")):
+            dependency_relative = path.relative_to(node_modules).as_posix()
+            if dependency_relative in MUTABLE_DEPENDENCY_CACHE_PATHS:
+                continue
             entry = path.relative_to(worktree).as_posix()
             if path.is_symlink():
                 manifest[entry] = f"link:{os.readlink(path)}"
@@ -3751,14 +3817,77 @@ def observe_task_diff(record: dict[str, Any], configured_repository: Path,
     return recorded_repository, worktree, head, committed, uncommitted
 
 
+def _admission_from_observation(record: dict[str, Any], repository: Path,
+                                config: dict[str, Any], task_id: str, head: str,
+                                dirty: list[str]) -> dict[str, Any]:
+    """Classify one already-observed task identity without refreezing Git."""
+    allowed, generated, source = effective_admission(record)
+    projection = path_origin_projection(
+        repository, record["base_sha"], head,
+        ref_sha(repository, config["target_ref"]), head, [], generated)
+    authored = projection["authored_paths"]
+    refused = sorted({path for path in authored + dirty
+                      if path_within(path, config["controller_private_paths"])
+                      or not path_within(path, allowed)} | set(projection["ambiguous_paths"]))
+    result = {"schema_version": "juno_task_admission_check.v1", "task_id": task_id,
+              "base_sha": record["base_sha"], "tip_sha": head,
+              "admission_source": source, "authored_paths": authored,
+              "dirty_paths": dirty, "origin_projection": projection,
+              "refused_paths": refused,
+              "recovery": "explicitly replan exact paths, then start a supported successor"}
+    if refused:
+        raise TaskWorkspaceError(
+            f"early exact admission refused; disallowed paths: {', '.join(refused)}; "
+            f"origin=authored-or-ambiguous; admission_source={source}; "
+            "explicitly replan exact paths before continuing")
+    return {**result, "outcome": "admitted"}
+
+
+def task_admission_check(controller: Path, task_id: str) -> dict[str, Any]:
+    """Deterministic read-only dirty/committed exact admission check."""
+    config = load_config(controller)
+    repository = product_repository(controller, config)
+    with state_lock(controller):
+        record = json.loads(json.dumps(read_state(controller)["tasks"].get(task_id)))
+    if not isinstance(record, dict):
+        raise TaskWorkspaceError("task has not been started")
+    verify_hydration_evidence(record, Path(record["worktree"]))
+    _repo, _worktree, head, _committed, dirty = observe_task_diff(
+        record, repository, config, task_id)
+    return _admission_from_observation(
+        record, repository, config, task_id, head, dirty)
+
+
+def _submission_origin_identity(projection: dict[str, Any]) -> str:
+    relevant = []
+    for row in projection.get("paths", []):
+        origins = set(row.get("origins", []))
+        if origins & {"authored", "generated", "ambiguous-legacy-admission"}:
+            relevant.append({key: row.get(key) for key in
+                             ("path", "origins", "base_blob", "source_blob", "candidate_blob")})
+    return stable_sha256({
+        "schema_version": projection.get("schema_version"),
+        "authored_paths": projection.get("authored_paths", []),
+        "target_derived_paths": projection.get("target_derived_paths", []),
+        "generated_paths": projection.get("generated_paths", []),
+        "ambiguous_paths": projection.get("ambiguous_paths", []),
+        "paths": relevant,
+    })
+
+
 def review_ready_closure(controller: Path, config: dict[str, Any], record: dict[str, Any],
                          configured_repository: Path, task_id: str,
                          runtime: dict[str, Any]) -> tuple[
                              Path, Path, str, list[str], dict[str, Any]]:
     """Validate the cheap finish boundary and bind it as one immutable closure."""
+    verify_hydration_evidence(record, Path(record["worktree"]))
+    _verify_dependency_tree(Path(record["worktree"]), config, record.get("hydration"))
     repository, worktree, head, changed = observe_working_task(
         record, configured_repository, config, task_id
     )
+    admission_check = _admission_from_observation(
+        record, repository, config, task_id, head, [])
+    changed = admission_check["authored_paths"]
     if head == record["base_sha"]:
         raise TaskWorkspaceError("task has no committed changes")
     if not changed:
@@ -3797,12 +3926,41 @@ def review_ready_closure(controller: Path, config: dict[str, Any], record: dict[
         policy_sha256 = hashlib.sha256(policy_path.read_bytes()).hexdigest()
     except OSError as exc:
         raise TaskWorkspaceError("risk policy is missing during task preflight") from exc
+    requirements = canonical_requirement_identity(controller, task_id)
+    dependency_evidence = validation_dependency_evidence(worktree, config)
+    validation_selection = validation_profile_selection(config, changed)
+    validation_rows = selected_standing_rows(config, changed)
+    tree_sha = git(repository, "rev-parse", f"{head}^{{tree}}")
+    submission_body = {
+        "task_id": task_id,
+        "requirements_sha256": requirements["requirements_sha256"],
+        "admitted_scope_sha256": stable_sha256(frozen_allowed),
+        "generated_scope_sha256": stable_sha256(frozen_generated_admission),
+        "base_sha": record["base_sha"], "tip_sha": head, "tree_sha": tree_sha,
+        "origin_projection_sha256": _submission_origin_identity(
+            admission_check["origin_projection"]),
+        "hydration_sha256": stable_sha256({
+            "workflow": record.get("creation_receipt", {}).get("hydration_workflow"),
+            "manifest_sha256": record.get("hydration", {}).get("manifest_sha256"),
+            "content_manifest_sha256": record.get("hydration", {}).get(
+                "content_manifest", {}).get("sha256")}),
+        "dependency_sha256": stable_sha256(dependency_evidence),
+        "runtime_sha256": runtime["running_sha256"],
+        "validation_sha256": stable_sha256({
+            "selection": validation_selection, "commands": validation_rows,
+            "documentation_policy": config.get("documentation_validation", {})}),
+        "risk_sha256": stable_sha256({
+            "policy_sha256": policy_sha256,
+            "task_risk_flags": record.get("risk_flags", [])}),
+    }
+    submission = {**submission_body,
+                  "submission_sha256": stable_sha256(submission_body)}
     closure_body = {
         "schema_version": "juno_task_review_ready_closure.v1",
         "task_id": task_id,
         "base_sha": record["base_sha"],
         "tip_sha": head,
-        "tree_sha": git(repository, "rev-parse", f"{head}^{{tree}}"),
+        "tree_sha": tree_sha,
         "changed_paths": changed,
         "changed_paths_sha256": stable_sha256(changed),
         "allowed_paths_sha256": stable_sha256(frozen_allowed),
@@ -3813,212 +3971,14 @@ def review_ready_closure(controller: Path, config: dict[str, Any], record: dict[
         "risk_policy_sha256": policy_sha256,
         "runtime_sha256": runtime["running_sha256"],
         "unresolved_findings_candidate_sha": record.get("prior_findings_candidate_sha"),
+        "origin_projection": admission_check["origin_projection"],
+        "requirements": requirements,
+        "dependency_evidence": dependency_evidence,
+        "validation_selection": validation_selection,
+        "submission": submission,
     }
     closure = {**closure_body, "closure_sha256": stable_sha256(closure_body)}
     return repository, worktree, head, changed, closure
-
-
-PREIMPLEMENTATION_CONTRACT_SCHEMA = "juno_preimplementation_acceptance.v1"
-CONTRACTS_ROOT = ".juno_task/runtime/contracts"
-
-
-def _contract_sections(body: str) -> dict[str, list[str]]:
-    """Split a canonical task body into bounded section bullet/line lists."""
-    sections: dict[str, list[str]] = {}
-    current: Optional[str] = None
-    for line in body.splitlines():
-        header = re.match(r"(?m)^##\s+(.{1,120})\s*$", line)
-        if header:
-            current = header.group(1).strip().lower()[:64]
-            sections.setdefault(current, [])
-            continue
-        if current is None:
-            continue
-        stripped = line.strip()
-        if stripped and len(stripped) <= 512 and not stripped.startswith("```"):
-            sections[current].append(stripped)
-    return {name: lines[:64] for name, lines in sections.items() if lines}
-
-
-def _parity_pairs(changed_paths: list[str]) -> list[dict[str, str]]:
-    """Runtime/template parity surfaces implied by changed paths."""
-    pairs: list[dict[str, str]] = []
-    runtime_prefix = ".juno_task/scripts/"
-    template_prefix = "juno-code/src/templates/scripts/"
-    for path in changed_paths:
-        if path.startswith(runtime_prefix):
-            twin = template_prefix + path[len(runtime_prefix):]
-            pairs.append({"runtime": path, "template": twin})
-        elif path.startswith(template_prefix):
-            twin = runtime_prefix + path[len(template_prefix):]
-            pairs.append({"runtime": twin, "template": path})
-    seen: set[tuple[str, str]] = set()
-    unique: list[dict[str, str]] = []
-    for pair in pairs:
-        key = (pair["runtime"], pair["template"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(pair)
-    return unique[:16]
-
-
-def _likely_test_files(changed_paths: list[str], worktree: Optional[Path]) -> list[str]:
-    """Existing sibling test files for changed sources (read-only discovery)."""
-    likely: list[str] = []
-    for path in changed_paths:
-        if not path.endswith((".ts", ".tsx", ".py")) or ".test." in path:
-            continue
-        stem, suffix = path.rsplit(".", 1)
-        candidate = f"{stem}.test.{suffix}"
-        if worktree is not None and (worktree / candidate).is_file():
-            likely.append(candidate)
-    return likely[:16]
-
-
-def preimplementation_contract(controller: Path, task_id: str) -> dict[str, Any]:
-    """Build one versioned read-only acceptance contract for a task.
-
-    The contract is deterministic and read-only: it freezes the requirements
-    digest, base/target identities, validation surface, invariant parity pairs,
-    likely files, focused tests, and the final reviewer checklist derived from
-    the task's own acceptance sections. Implementation handoff is refused
-    (status blocked_handoff) while material owner decisions remain open. A new
-    contract supersedes its predecessor by reference and never rewrites it.
-    """
-    if not TASK_RE.fullmatch(task_id):
-        raise TaskWorkspaceError("unsafe task id")
-    manifest_path, manifest_bytes = task_manifest(controller, task_id)
-    config = load_config(controller)
-    repository = product_repository(controller, config)
-    runtime_candidates = [controller / ".juno_task/scripts/task_workspace.py",
-                           repository / ".juno_task/scripts/task_workspace.py"]
-    runtime_sha: Optional[str] = None
-    for candidate in runtime_candidates:
-        try:
-            runtime_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            break
-        except OSError:
-            continue
-    try:
-        manifest = json.loads(manifest_bytes[: manifest_bytes.find(b"---", 4)] or b"{}")
-    except (UnicodeError, json.JSONDecodeError):
-        manifest = {}
-    body_match = re.search(rb"<!-- juno:body:start -->\n(.*?)<!-- juno:body:end -->",
-                           manifest_bytes, re.S)
-    body = body_match.group(1).decode("utf-8", errors="replace") if body_match else ""
-    sections = _contract_sections(body)
-    requirements_sha = hashlib.sha256(manifest_bytes).hexdigest()
-
-    record: dict[str, Any] = {}
-    try:
-        record = read_state(controller)["tasks"].get(task_id) or {}
-    except TaskWorkspaceError:
-        record = {}
-    worktree_value = record.get("worktree")
-    worktree = Path(worktree_value) if isinstance(worktree_value, str) and worktree_value else None
-    changed = sorted(set(record.get("changed_paths") or []))[:64]
-    target_ref = config.get("target_ref") or record.get("target_ref")
-    base_sha = record.get("base_sha")
-    source_identity: dict[str, Optional[str]] = {"head": None, "tree": None}
-    if worktree is not None and worktree.is_dir():
-        head = git(worktree, "rev-parse", "HEAD", check=False)
-        tree = git(worktree, "rev-parse", "HEAD^{tree}", check=False)
-        source_identity = {"head": head or None, "tree": tree or None}
-
-    profiles: list[dict[str, Any]] = []
-    changed_roots = {path.split("/")[0] for path in changed if path}
-    for profile in config.get("validation_profiles") or []:
-        if not isinstance(profile, dict):
-            continue
-        roots = set(profile.get("path_roots") or [])
-        if not changed or (roots & changed_roots):
-            profiles.append({
-                "id": profile.get("id"),
-                "path_roots": sorted(roots),
-                "commands": [row.get("id") for row in profile.get("commands") or []
-                             if isinstance(row, dict)],
-            })
-
-    owner_decisions: list[str] = [
-        line for line in sections.get("unresolved decisions", [])
-        if re.search(r"\b(must|should|needs)?\s*(owner|decision|authorize)\b", line)
-    ][:8]
-    acceptance = (sections.get("acceptance") or sections.get("acceptance criteria")
-                  or sections.get("required behavior") or [])
-    reviewer_checklist = [f"Acceptance: {line}" for line in acceptance[:24]]
-    for pair in _parity_pairs(changed):
-        reviewer_checklist.append(
-            f"Parity: {pair['runtime']} is byte-identical to {pair['template']}")
-    reviewer_checklist = reviewer_checklist[:32]
-
-    contracts_dir = controller / CONTRACTS_ROOT / task_id
-    contracts_dir.mkdir(parents=True, exist_ok=True)
-    predecessors = sorted(contracts_dir.glob("v*.json"))
-    predecessor: Optional[dict[str, str]] = None
-    if predecessors:
-        latest = predecessors[-1]
-        predecessor = {"path": str(latest),
-                       "sha256": hashlib.sha256(latest.read_bytes()).hexdigest()}
-
-    contract = {
-        "schema_version": PREIMPLEMENTATION_CONTRACT_SCHEMA,
-        "task_id": task_id,
-        "status": "blocked_handoff" if owner_decisions else "ready",
-        "version": len(predecessors) + 1,
-        "predecessor": predecessor,
-        "binding": {
-            "task_manifest_path": str(manifest_path),
-            "task_manifest_sha256": requirements_sha,
-            "task_last_modified": manifest.get("last_modified"),
-            "base_sha": base_sha, "target_ref": target_ref,
-            "source": source_identity,
-        },
-        "planner": {"mode": "deterministic-static", "runtime_sha256": runtime_sha,
-                    "package_version": None, "model": None, "session_id": None},
-        "requirements_sections": {name: lines for name, lines in sections.items()},
-        "changed_paths": changed,
-        "parity_pairs": _parity_pairs(changed),
-        "likely_test_files": _likely_test_files(changed, worktree),
-        "validation_profiles": profiles[:8],
-        "owner_decisions": owner_decisions,
-        "implementation_choices": [
-            line for line in sections.get("implementation choices", [])][:16],
-        "reviewer_checklist": reviewer_checklist,
-        "negative_cases": [f"Refuse: {line}" for line in
-                           (sections.get("exclusions") or sections.get("risks and constraints")
-                            or [])][:16],
-    }
-    destination = contracts_dir / f"v{contract['version']}.json"
-    if destination.exists():
-        raise TaskWorkspaceError("contract version already exists")
-    payload = (json.dumps(contract, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False) + "\n").encode()
-    with tempfile.NamedTemporaryFile(dir=contracts_dir, prefix=".contract-",
-                                     delete=False) as handle:
-        handle.write(payload); handle.flush(); os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    os.replace(temporary, destination)
-    return {**contract, "contract_path": str(destination),
-            "contract_sha256": hashlib.sha256(payload).hexdigest()}
-
-
-def active_preimplementation_contract(controller: Path,
-                                      task_id: str) -> Optional[dict[str, Any]]:
-    """Latest non-superseded contract for a task, or None."""
-    contracts_dir = controller / CONTRACTS_ROOT / task_id
-    try:
-        versions = sorted(contracts_dir.glob("v*.json"))
-    except OSError:
-        return None
-    if not versions:
-        return None
-    try:
-        contract = json.loads(versions[-1].read_bytes())
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(contract, dict) or contract.get("task_id") != task_id:
-        return None
-    return contract
 
 
 def _standing_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -4035,11 +3995,6 @@ def _standing_root(controller: Path, task_id: str) -> Path:
     if not TASK_RE.fullmatch(task_id):
         raise TaskWorkspaceError("unsafe task id")
     return controller / STANDING_ROOT / task_id
-
-
-def _git_blob(repository: Path, head: str, relative: str) -> Optional[str]:
-    value = git(repository, "rev-parse", f"{head}:{relative}", check=False)
-    return value if SHA_RE.fullmatch(value) else None
 
 
 def _command_input_closure(repository: Path, head: str, row: dict[str, Any],
@@ -4065,7 +4020,8 @@ def compile_standing_operation_snapshot(**inputs: Any) -> dict[str, Any]:
 
 def _standing_snapshot_inputs(repository: Path, candidate: str, target: str,
                               planned: list[dict[str, Any]], config: dict[str, Any],
-                              runtime: dict[str, Any], documentation: dict[str, Any]) -> dict[str, Any]:
+                              runtime: dict[str, Any], documentation: dict[str, Any],
+                              submission: dict[str, Any]) -> dict[str, Any]:
     commands = [entry["command"] for entry in planned]
     routing = {row["id"]: "standing" for row in commands}
     validation_units = [
@@ -4093,11 +4049,14 @@ def _standing_snapshot_inputs(repository: Path, candidate: str, target: str,
             "routing": routing, "environment": environment,
             "phase_units": phase_units,
             "managed_outputs": {"task_workspace_runtime": str(runtime["running_sha256"])},
+            "submission": {key: value for key, value in submission.items()
+                           if key != "submission_sha256"},
             "discovery": {"complete": True, "kind": "exact-import-closure"}}
 
 
 def standing_checkpoint(controller: Path, task_id: str,
-                        lease_token: Optional[str] = None) -> dict[str, Any]:
+                        lease_token: Optional[str] = None,
+                        submission_closure: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     config = load_config(controller)
     require_task(controller, task_id)
     repository = product_repository(controller, config)
@@ -4115,9 +4074,23 @@ def standing_checkpoint(controller: Path, task_id: str,
         if not checkpoint_admission.admitted:
             raise TaskWorkspaceError(checkpoint_admission.finding.message)
         frozen = json.loads(json.dumps(record))
-    verify_hydration_evidence(frozen, Path(frozen["worktree"]))
-    _repo, worktree, head, changed = observe_working_task(
-        frozen, repository, config, task_id)
+    if submission_closure is None:
+        _repo, worktree, head, changed, submission_closure = review_ready_closure(
+            controller, config, frozen, repository, task_id, runtime)
+    else:
+        worktree = Path(frozen["worktree"])
+        head = submission_closure.get("tip_sha")
+        changed = submission_closure.get("changed_paths")
+        submission = submission_closure.get("submission")
+        body = {key: value for key, value in submission_closure.items()
+                if key != "closure_sha256"}
+        if (submission_closure.get("schema_version") != "juno_task_review_ready_closure.v1"
+                or submission_closure.get("closure_sha256") != stable_sha256(body)
+                or not isinstance(submission, dict)
+                or submission.get("submission_sha256") != stable_sha256({
+                    key: value for key, value in submission.items()
+                    if key != "submission_sha256"})):
+            raise TaskWorkspaceError("immutable task submission is malformed or tampered")
     if head == frozen["base_sha"] or not changed:
         raise TaskWorkspaceError("standing checkpoint requires a committed product diff")
     path_status = lifecycle_runtime.changed_path_status(
@@ -4147,11 +4120,12 @@ def standing_checkpoint(controller: Path, task_id: str,
                 coherence["findings"], sort_keys=True))
     operation_snapshot = compile_standing_operation_snapshot(**_standing_snapshot_inputs(
         repository, head, ref_sha(repository, config["target_ref"]), planned,
-        config, runtime, documentation))
+        config, runtime, documentation, submission_closure["submission"]))
     body = {"schema_version": STANDING_PLAN_SCHEMA, "task_id": task_id,
             "base_sha": frozen["base_sha"], "tip_sha": head,
             "tree_sha": git(repository, "rev-parse", f"{head}^{{tree}}"),
             "branch_ref": frozen["branch_ref"], "changed_paths": changed,
+            "submission": submission_closure["submission"],
             "changed_path_status": path_status, "documentation_route": documentation,
             "grouped_coherence": coherence, "operation_snapshot": operation_snapshot,
             "selection": routing, "commands": planned,
@@ -4260,7 +4234,10 @@ def standing_evidence_run(controller: Path, task_id: str,
             task_id, None if not isinstance(record, dict) else record.get("state")))
     if not evidence_gate.admitted:
         raise TaskWorkspaceError(evidence_gate.finding.message)
+    verify_hydration_evidence(record, Path(record["worktree"]))
     _repo, worktree, head, changed = observe_working_task(record, repository, config, task_id)
+    changed = _admission_from_observation(
+        record, repository, config, task_id, head, [])["authored_paths"]
     if head != plan["tip_sha"] or changed != plan["changed_paths"]:
         raise TaskWorkspaceError("standing checkpoint is stale; create a new task checkpoint")
     runtime = require_current_runtime(repository, ref_sha(repository, config["target_ref"]), controller)
@@ -4268,7 +4245,7 @@ def standing_evidence_run(controller: Path, task_id: str,
         repository, head, entry["command"], config, runtime)} for entry in plan["commands"]]
     current_snapshot = compile_standing_operation_snapshot(**_standing_snapshot_inputs(
         repository, head, ref_sha(repository, config["target_ref"]), current_planned,
-        config, runtime, plan["documentation_route"]))
+        config, runtime, plan["documentation_route"], plan["submission"]))
     invalidation = operation_runtime.phase_invalidation(
         plan.get("operation_snapshot"), current_snapshot)
     affected = [row for row in invalidation
@@ -4335,78 +4312,53 @@ def standing_evidence_run(controller: Path, task_id: str,
             receipt = loaded[index]
             if entry.finding is not None:
                 raise TaskWorkspaceError(entry.finding.message)
-            execute = False
-            if entry.action == decisions.ACTION_FAILURE_STANDS:
-                failure = (row, receipt["result"])
-            elif entry.action == decisions.ACTION_INVALIDATE:
-                receipt_path = base_receipt_path.with_name(
-                    base_receipt_path.stem + (entry.supersession_suffix or ""))
-                receipt = None; invalidated += 1; execute = True
+            execute = entry.action not in {
+                decisions.ACTION_REUSE, decisions.ACTION_FAILURE_STANDS}
+            if entry.action == decisions.ACTION_INVALIDATE:
+                invalidated += 1
                 decision_log.append(lifecycle_runtime.evidence_decision(
                     row["id"], "invalidated", closure=closure,
                     invalidation=entry.invalidation,
-                    reason="failed evidence remains immutable; readiness changed"))
-            elif entry.action == decisions.ACTION_REUSE:
-                reused += 1
-                decision_log.append(lifecycle_runtime.evidence_decision(
-                    row["id"], "reused", closure=closure,
-                    source={"path": str(receipt_path),
-                            "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest()}))
-            else:
-                execute = True
-            if execute:
-                cwd = (worktree / row["cwd"]).resolve()
-                try: cwd.relative_to(worktree)
-                except ValueError as exc:
-                    raise TaskWorkspaceError("standing validation cwd escaped task worktree") from exc
-                evidence = (_active_documentation_validation(
-                                repository, head, plan, row,
-                                config["documentation_validation"])
-                            if row["argv"] == lifecycle_runtime.ACTIVE_DOC_ARGV
-                            else run_validation(row, cwd))
-                policy_identity = {
-                    "routing_config_sha256": closure.get("routing_config_sha256"),
-                    "risk_policy_sha256": closure.get("risk_policy_sha256"),
-                    "runtime_sha256": closure.get("runtime_sha256")}
-                snapshot_sha = plan["operation_snapshot"]["snapshot_sha256"]
-                outcome_identity = {
-                    "schema_version": closure.get("outcome_schema"),
-                    "result_sha256": stable_sha256(evidence),
-                    "verdict": ("PASSED" if not evidence["timed_out"]
-                                and evidence["exit_code"] == 0 else "FAILED")}
-                index_identity = {
-                    "command_closure_sha256": closure["input_closure_sha256"],
-                    "policy_identity": policy_identity,
-                    "outcome_identity": outcome_identity,
-                    "repository_identity": lifecycle_runtime.repository_identity(repository),
-                    "snapshot_lineage": {"producer_snapshot_sha256": snapshot_sha,
-                                         "consuming_snapshot_sha256": snapshot_sha}}
-                receipt = {
-                    "schema_version": CANONICAL_VALIDATION_RECEIPT_SCHEMA,
-                    "receipt_kind": "executed", "phase": "task_closure",
-                    "task_id": task_id, "plan_sha256": plan["plan_sha256"],
-                    "tip_sha": head, "command_index": index, "command_id": row["id"],
-                    "command": row, "input_closure": closure,
-                    "complete_input_identity": lifecycle_runtime.complete_input_identity(closure),
-                    "policy_identity": policy_identity, "outcome_identity": outcome_identity,
-                    "index_identity": index_identity,
-                    "index_sha256": stable_sha256(index_identity),
-                    "consuming_candidate": {"candidate_sha": head,
-                                             "candidate_tree": plan["tree_sha"]},
-                    "snapshot_lineage": index_identity["snapshot_lineage"],
-                    "source": None,
-                    "decision_reason": "supported registered validation command execution",
-                    "readiness_sha256": readiness_sha256,
-                    "result": evidence, "recorded_at_unix_ns": time.time_ns()}
-                _standing_atomic(receipt_path, receipt); executed += 1
+                    reason="legacy readiness wrapper retired; canonical command identity is unchanged"))
+            legacy = None
+            if receipt is not None:
+                legacy = (receipt, {"path": str(base_receipt_path),
+                                    "sha256": hashlib.sha256(base_receipt_path.read_bytes()).hexdigest()})
+            cwd = (worktree / row["cwd"]).resolve()
+            try: cwd.relative_to(worktree)
+            except ValueError as exc:
+                raise TaskWorkspaceError("standing validation cwd escaped task worktree") from exc
+
+            def execute_terminal() -> dict[str, Any]:
+                return (_active_documentation_validation(
+                            repository, head, plan, row,
+                            config["documentation_validation"])
+                        if row["argv"] == lifecycle_runtime.ACTIVE_DOC_ARGV
+                        else run_validation(row, cwd))
+
+            try:
+                terminal = lifecycle_runtime.consume_or_execute_command_result(
+                    controller / CANONICAL_VALIDATION_ROOT, repository, closure,
+                    execute_terminal, phase="task_closure", task_id=task_id,
+                    legacy=legacy)
+            except lifecycle_runtime.LifecycleContractError as exc:
+                raise TaskWorkspaceError(str(exc)) from exc
+            receipt = terminal["receipt"]
+            reference = terminal["reference"]
+            receipt_path = Path(reference["path"])
+            actual = terminal["decision"]
+            if actual == "executed":
+                executed += 1
                 active_wall_ms += max(0, int(
-                    evidence.get("timing", {}).get("wall_duration_ms",
-                                                     evidence.get("duration_ms", 0))))
-                decision_log.append(lifecycle_runtime.evidence_decision(
-                    row["id"], "executed", closure=closure,
-                    source={"path": str(receipt_path)}))
-                if receipt["result"]["timed_out"] or receipt["result"]["exit_code"]:
-                    failure = (row, receipt["result"])
+                    receipt["result"].get("timing", {}).get(
+                        "wall_duration_ms", receipt["result"].get("duration_ms", 0))))
+            else:
+                reused += 1
+            decision_log.append(lifecycle_runtime.evidence_decision(
+                row["id"], actual, closure=closure, source=reference,
+                reason="canonical terminal command result"))
+            if receipt["result"]["timed_out"] or receipt["result"]["exit_code"]:
+                failure = (row, receipt["result"])
             receipts.append({"path": str(receipt_path),
                              "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
                              "command_id": row["id"]})
@@ -4450,6 +4402,42 @@ def standing_evidence_status(controller: Path, task_id: str) -> dict[str, Any]:
             "summary": summary}
 
 
+def _submission_receipt(controller: Path, task_id: str,
+                        closure: dict[str, Any]) -> dict[str, str]:
+    submission = closure.get("submission")
+    if (not isinstance(submission, dict)
+            or submission.get("submission_sha256") != stable_sha256({
+                key: value for key, value in submission.items()
+                if key != "submission_sha256"})):
+        raise TaskWorkspaceError("immutable task submission is malformed")
+    path = (controller / SUBMISSION_ROOT / task_id
+            / f"{submission['submission_sha256']}.json")
+    data = (json.dumps(closure, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TaskWorkspaceError("immutable task submission receipt is malformed") from exc
+        existing_body = ({key: value for key, value in existing.items()
+                          if key != "closure_sha256"}
+                         if isinstance(existing, dict) else {})
+        existing_submission = existing.get("submission") if isinstance(existing, dict) else None
+        if (not isinstance(existing_submission, dict)
+                or existing.get("schema_version") != "juno_task_review_ready_closure.v1"
+                or existing.get("closure_sha256") != stable_sha256(existing_body)
+                or existing_submission != submission):
+            raise TaskWorkspaceError("immutable task submission receipt is tampered or collided")
+    else:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+    return {"path": str(path.resolve()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "submission_sha256": submission["submission_sha256"]}
+
+
 def preflight(controller: Path, task_id: str) -> dict[str, Any]:
     """Run finish identity/admission checks without validation or queue mutation."""
     if not TASK_RE.fullmatch(task_id):
@@ -4472,15 +4460,16 @@ def preflight(controller: Path, task_id: str) -> dict[str, Any]:
         if not preflight_admission.admitted:
             raise TaskWorkspaceError(preflight_admission.finding.message)
         frozen_record = json.loads(json.dumps(record))
-    verify_hydration_evidence(frozen_record, Path(frozen_record["worktree"]))
     _, worktree, head, changed, closure = review_ready_closure(
         controller, config, frozen_record, configured_repository, task_id, runtime
     )
     if load_config(controller) != config:
         raise TaskWorkspaceError("task workspace policy changed during preflight")
+    receipt = _submission_receipt(controller, task_id, closure)
     return {"schema_version": RECORD_SCHEMA, "task_id": task_id, "state": "WORKING",
             "outcome": "preflight_passed", "worktree": str(worktree), "tip_sha": head,
-            "changed_paths": changed, "review_ready_closure": closure}
+            "changed_paths": changed, "submission_receipt": receipt,
+            "review_ready_closure": closure}
 
 
 def _finish_once(controller: Path, task_id: str,
@@ -4547,13 +4536,12 @@ def _finish_once(controller: Path, task_id: str,
                 f"recover with: {KANBAN_SYNC_RECOVERY.format(task=task_id)}") from exc
         return {**_stamp_kanban_sync(controller, task_id, queued_record, queue_sync),
                 "outcome": "already_queued"}
-    verify_hydration_evidence(frozen_record, Path(frozen_record["worktree"]))
-
     # Validations run outside the controller state lock. Independent feature
     # finishes therefore stay concurrent; the compare below prevents stale state.
     repository, worktree, head, changed, closure = review_ready_closure(
         controller, config, frozen_record, configured_repository, task_id, runtime
     )
+    submission_receipt = _submission_receipt(controller, task_id, closure)
     _frozen_allowed, frozen_generated_admission, _admission_source = effective_admission(
         frozen_record)
     frozen_umbrella = (
@@ -4562,7 +4550,8 @@ def _finish_once(controller: Path, task_id: str,
         else frozen_record.get("creation_receipt", {}).get("umbrella_admission")
     )
     routing = validation_profile_selection(config, changed)
-    checkpoint_plan = standing_checkpoint(controller, task_id, lease_token)
+    checkpoint_plan = standing_checkpoint(
+        controller, task_id, lease_token, submission_closure=closure)
     selected_focused = [planned["command"] for planned in checkpoint_plan["commands"]]
     standing = standing_evidence_run(controller, task_id, raise_on_failure=False,
                                      lease_token=lease_token)
@@ -4602,9 +4591,12 @@ def _finish_once(controller: Path, task_id: str,
     if load_config(controller) != config:
         raise TaskWorkspaceError("task workspace policy changed during focused validation")
     try:
+        _verify_dependency_tree(worktree, config, record.get("hydration"))
         post_repository, post_worktree, post_head, post_changed = observe_working_task(
             record, configured_repository, config, task_id
         )
+        post_changed = _admission_from_observation(
+            record, post_repository, config, task_id, post_head, [])["authored_paths"]
     except TaskWorkspaceError as exc:
         raise TaskWorkspaceError("task tip or worktree changed during focused validation") from exc
     if ((post_repository, post_worktree, post_head, post_changed)
@@ -4612,6 +4604,7 @@ def _finish_once(controller: Path, task_id: str,
         raise TaskWorkspaceError("task tip or worktree changed during focused validation")
     queued = {**record, "state": "QUEUED", "tip_sha": head, "changed_paths": changed,
               "review_ready_closure": closure,
+              "submission_receipt": submission_receipt,
               "validation_routing": routing,
               "review_round": 1,
               "validation": validations, "last_validation_outcome": "PASSED"}
@@ -4664,171 +4657,7 @@ def finish(controller: Path, task_id: str, lease_token: Optional[str] = None) ->
         return _finish_once(controller, task_id, lease_token)
 
 
-HANDOFF_SCHEMA = "juno_run_handoff.v1"
-HANDOFF_ROOT = ".juno_task/runtime/handoff"
-HANDOFF_MAX_BYTES = 8192
-HANDOFF_NEXT_COMMANDS = {
-    "NOT_STARTED": "yy task start {task}",
-    "WORKING": "yy task preflight {task}",
-    KANBAN_SYNC_STATE: KANBAN_SYNC_RECOVERY,
-    "QUEUED": "yy merge next",
-    "AWAITING_RISK": "yy merge review {task}",
-    "AWAITING_RELEASE": "yy release train status <declaration>",
-    "REVIEWING": "yy merge review {task}",
-    "REVIEW_FINDINGS": "repair findings in the task worktree, then yy merge reopen {task}",
-    "REVIEW_FINDINGS_EXHAUSTED": "yy merge reconcile plan",
-    "CONFLICT": "yy merge resolve {task}",
-    "CONFLICT_RESOLVED": "yy merge next",
-    "REOPENING": "yy merge status",
-    "REQUEUING_STALE": "yy merge refresh plan {task}",
-    "RISK_EVIDENCE_READY": "yy merge next {task}",
-    "MERGING": "yy merge next",
-    "MERGED": "none: task integrated; archive the Kanban task",
-    "WITHDRAWN": "none: candidate withdrawn; create or bind a continuation task",
-}
-
-
 _handoff_phase = decisions.handoff_phase
-
-
-def run_handoff(controller: Path, task_id: str) -> dict[str, Any]:
-    """Deterministic bounded evidence-backed handoff for the next agent.
-
-    Everything is derived from durable Juno evidence (task record, queue
-    attempt, receipts, runtime generation) - never model memory. Missing
-    values are explicit; conflicting evidence fails closed with the
-    reconciliation command instead of a misleading next step.
-    """
-    if not TASK_RE.fullmatch(task_id):
-        raise TaskWorkspaceError("unsafe task id")
-    config = load_config(controller)
-    require_task(controller, task_id)
-    repository = product_repository(controller, config)
-    current_target = optional_ref_sha(repository, config["target_ref"])
-    generation = runtime_generation(repository, current_target) if current_target else None
-    state = read_state(controller)
-    record = state.get("tasks", {}).get(task_id) or {}
-    task_state = record.get("state") or "NOT_STARTED"
-    attempt = record.get("queue_attempt") if isinstance(record.get("queue_attempt"), dict) else {}
-
-    validation_rows = [
-        {"id": row.get("id"), "exit_code": row.get("exit_code"),
-         "timed_out": bool(row.get("timed_out"))}
-        for row in (record.get("validation") or attempt.get("validation") or [])
-        if isinstance(row, dict)][:12]
-    risk = attempt.get("risk") if isinstance(attempt.get("risk"), dict) else {}
-    progress = risk.get("review_progress") if isinstance(risk, dict) else {}
-    admission = (progress or {}).get("full_suite_admission") \
-        if isinstance(progress, dict) else None
-    receipts = [row.get("receipt_path") for row in
-                ((admission or {}).get("receipts") or [])
-                if isinstance(row, dict) and isinstance(row.get("receipt_path"), str)][:16]
-
-    conflicts: list[str] = []
-    candidate_sha = attempt.get("candidate_sha") or record.get("candidate_sha")
-    if task_state in {"AWAITING_RISK", "REVIEWING", "RISK_EVIDENCE_READY"}:
-        if not candidate_sha:
-            conflicts.append("queue state requires a frozen candidate identity")
-        elif isinstance(admission, dict) and not receipts:
-            conflicts.append("full-suite admission has no bound receipts")
-    if task_state == "MERGED" and not (attempt.get("outcome") == "MERGED"
-                                       or record.get("outcome") == "MERGED"):
-        conflicts.append("merged state lacks its merged attempt outcome")
-
-    next_command = ("yy integration runtime-doctor" if conflicts else
-                    HANDOFF_NEXT_COMMANDS.get(task_state, "yy merge status").format(task=task_id))
-    evidence_reuse = [row.get("command_id") for row in (attempt.get("evidence_reuse") or [])
-                      if isinstance(row, dict)][:12]
-    handoff = {
-        "schema_version": HANDOFF_SCHEMA, "task_id": task_id,
-        "phase": _handoff_phase(task_state), "state": task_state,
-        "conflicts": conflicts, "next_command": next_command,
-        "identity": {
-            "controller_branch": git(controller, "rev-parse", "--abbrev-ref", "HEAD",
-                                      check=False) or None,
-            "controller_head": git(controller, "rev-parse", "HEAD", check=False) or None,
-            "product_repository": str(repository),
-            "target_ref": config["target_ref"],
-            "target_sha": current_target,
-            "runtime_generation_current": bool(generation and generation.get("current")),
-            "runtime_running_sha256": (generation or {}).get("running_sha256"),
-            "node_version": os.environ.get("JUNO_NODE_VERSION") or None,
-        },
-        "task": {
-            "base_sha": record.get("base_sha") or attempt.get("base_sha"),
-            "candidate_sha": candidate_sha,
-            "worktree": record.get("worktree"),
-            "tip_sha": record.get("tip_sha"),
-            "changed_path_count": len(record.get("changed_paths") or []),
-            "validation": validation_rows,
-            "review_status": (risk or {}).get("status"),
-            "review_round": record.get("review_round"),
-            "evidence_reuse_commands": evidence_reuse,
-            "blockers": sorted(record.get("blocked_by") or [])[:8],
-        },
-        "references": {
-            "full_suite_receipts": receipts,
-            "queue_evidence": (risk or {}).get("evidence"),
-            "task_manifest": str(task_file(controller, task_id)),
-        },
-    }
-    text = _handoff_text(handoff)
-    if len(text.encode()) > HANDOFF_MAX_BYTES:
-        raise TaskWorkspaceError("handoff exceeded its documented byte budget")
-    directory = controller / HANDOFF_ROOT
-    directory.mkdir(parents=True, exist_ok=True)
-    for name, payload in ((f"{task_id}.json", (json.dumps(
-                                handoff, sort_keys=True, indent=1) + "\n").encode()),
-                          (f"{task_id}.md", text.encode())):
-        with tempfile.NamedTemporaryFile(dir=directory, prefix="." + name, delete=False) as handle:
-            handle.write(payload); handle.flush(); os.fsync(handle.fileno())
-            temporary = Path(handle.name)
-        os.replace(temporary, directory / name)
-    return {**handoff, "handoff_text": text,
-            "handoff_paths": [str(directory / f"{task_id}.json"),
-                              str(directory / f"{task_id}.md")]}
-
-
-def _handoff_text(handoff: dict[str, Any]) -> str:
-    phases = ["planned", "working", "queued", "validating", "reviewing",
-              "approved", "merged"]
-    phase = handoff["phase"]
-    on_rail = phase in phases
-    completed = phases.index(phase) if on_rail else -1
-    markers = " ".join(
-        ("[x]" if (completed > index or phase == "merged") else
-         "[>]" if phase == name else "[ ]")
-        for index, name in enumerate(phases))
-    flow = " -> ".join(phases) + "\n" + markers
-    if not on_rail:
-        flow += f"\n! off-rail phase: {phase}"
-    identity, task, references = handoff["identity"], handoff["task"], handoff["references"]
-    validation = ", ".join(f"{row['id']}={row['exit_code']}"
-                           for row in task["validation"][:6]) or "none recorded"
-    lines = [
-        f"# Run handoff: {handoff['task_id']}",
-        "",
-        "```",
-        flow,
-        "```",
-        f"- state: {handoff['state']} (phase {phase})",
-        f"- conflicts: {', '.join(handoff['conflicts']) or 'none'}",
-        f"- next command: {handoff['next_command']}",
-        f"- target: {identity['target_ref']} @ {identity['target_sha']}",
-        f"- runtime: current={identity['runtime_generation_current']} "
-        f"sha={str(identity['runtime_running_sha256'])[:12]}",
-        f"- base {str(task['base_sha'])[:12]} candidate {str(task['candidate_sha'])[:12]} "
-        f"tip {str(task['tip_sha'])[:12]}",
-        f"- validation: {validation}",
-        f"- review: {task['review_status']} round {task['review_round']}",
-        f"- evidence reuse: {', '.join(task['evidence_reuse_commands']) or 'none'}",
-        f"- blockers: {', '.join(task['blockers']) or 'none'}",
-        f"- receipts: {'; '.join(str(p) for p in references['full_suite_receipts'][:4]) or 'none'}",
-        "- cost/duration: not available through canonical provenance (explicitly absent)",
-        "",
-        f"Full JSON: {handoff['handoff_paths'][0] if 'handoff_paths' in handoff else 'controller runtime'}",
-    ]
-    return "\n".join(lines)
 
 
 def status(controller: Path, task_id: str) -> dict[str, Any]:
@@ -6194,21 +6023,33 @@ def _launch_task_worker(controller: Path, task_id: str, record: dict[str, Any],
                         run_dir: Path, prompt_seed: Path, *, repair: bool,
                         timeout_seconds: int,
                         context_bytes: bytes = b"",
-                        hydration_gate: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+                        hydration_gate: Optional[dict[str, Any]] = None,
+                        reuse_existing_admission: bool = False) -> dict[str, Any]:
     worktree = Path(record["worktree"])
     before = git(worktree, "rev-parse", "HEAD")
-    if hydration_gate is None:
-        hydration_gate = _managed_hydration_gate(controller, record)
-        record = hydration_gate["record"]
-    create, verify, edit = _managed_worker_receipts(run_dir, record, hydration_gate)
     prompt = run_dir / "worker-prompt.md"
-    task_data = task_file(controller, task_id).read_bytes()
-    seed = prompt_seed.read_bytes()
-    if not seed or len(seed) + len(task_data) + len(context_bytes) > 4 * 1024 * 1024:
-        raise TaskWorkspaceError("managed task-run prompt is empty or unbounded")
-    prompt.write_bytes(seed + b"\n\n# Canonical task\n\n" + task_data
-                       + (b"\n\n# Exact failure context\n\n" + context_bytes
-                          if context_bytes else b""))
+    if reuse_existing_admission:
+        create, verify, edit = (run_dir / "create-receipt.json",
+                                run_dir / "verify-receipt.json",
+                                run_dir / "edit-preflight-receipt.json")
+        for label, path in (("create", create), ("verify", verify), ("edit-preflight", edit)):
+            if not path.is_file():
+                raise TaskWorkspaceError(
+                    f"same-worker redispatch {label} receipt is unavailable")
+        if not prompt.is_file() or not prompt.read_bytes():
+            raise TaskWorkspaceError("same-worker redispatch prompt is unavailable")
+    else:
+        if hydration_gate is None:
+            hydration_gate = _managed_hydration_gate(controller, record)
+            record = hydration_gate["record"]
+        create, verify, edit = _managed_worker_receipts(run_dir, record, hydration_gate)
+        task_data = task_file(controller, task_id).read_bytes()
+        seed = prompt_seed.read_bytes()
+        if not seed or len(seed) + len(task_data) + len(context_bytes) > 4 * 1024 * 1024:
+            raise TaskWorkspaceError("managed task-run prompt is empty or unbounded")
+        prompt.write_bytes(seed + b"\n\n# Canonical task\n\n" + task_data
+                           + (b"\n\n# Exact failure context\n\n" + context_bytes
+                              if context_bytes else b""))
     out_dir = run_dir / "managed-agent"
     runner = controller / ".juno_task/scripts/managed_agent_runner.py"
     branch = git(controller, "symbolic-ref", "-q", "HEAD")
@@ -7635,7 +7476,7 @@ def _worktree_recovery_classification(record: dict[str, Any]) -> dict[str, Any]:
         "preservation": "dirty bytes are preserved for one bounded recovery agent",
         "escalate_only": ["semantic ambiguity", "scope or authority expansion",
                           "sensitive action", "unrecoverable state"],
-        "next_command": "yy task handoff " + str(record.get("task_id")),
+        "next_command": "yy task status " + str(record.get("task_id")),
     }
 
 
@@ -7726,7 +7567,7 @@ def lease_release(controller: Path, task_id: str, lease_token: Optional[str]) ->
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("operation", choices=(
-        "start", "run", "recover-predispatch", "recover-wall-budget", "status", "hydrate", "preflight", "finish", "contract", "handoff",
+        "start", "run", "recover-predispatch", "recover-wall-budget", "status", "admission", "hydrate", "preflight", "finish",
         "checkpoint", "child-checkpoint", "evidence-run", "evidence-status", "evidence-await",
         "recovery-plan", "recovery-authorize", "recovery-apply", "runtime-bootstrap",
         "sync", "doctor", "lease-status", "lease-heartbeat", "lease-handoff",
@@ -7868,10 +7709,6 @@ def main(argv: list[str] | None = None) -> int:
                     result = recover_task_wall_budget(
                         controller, args.task, args.run_id, args.attempt,
                         args.predispatch_receipt_sha256, args.original_deadline_unix_ns)
-                elif args.operation == "contract":
-                    result = preimplementation_contract(controller, args.task)
-                elif args.operation == "handoff":
-                    result = run_handoff(controller, args.task)
                 elif args.operation == "checkpoint":
                     result = standing_checkpoint(controller, args.task, args.lease_token)
                 elif args.operation == "child-checkpoint":
@@ -7894,6 +7731,8 @@ def main(argv: list[str] | None = None) -> int:
                     result = kanban_sync_doctor(controller, args.task or None)
                 elif args.operation == "status":
                     result = status(controller, args.task)
+                elif args.operation == "admission":
+                    result = task_admission_check(controller, args.task)
                 elif args.operation == "preflight":
                     result = preflight(controller, args.task)
                 elif args.operation == "hydrate":

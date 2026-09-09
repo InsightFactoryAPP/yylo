@@ -101,7 +101,7 @@ VHC90C_CREATION_PATHS = [
     ".juno_task/scripts/invocation_correlation.py",
     ".juno_task/scripts/managed_agent_runner.py", ".juno_task/scripts/merge_queue.py",
     ".juno_task/scripts/metadata_controller.py", ".juno_task/scripts/parallel_runner.sh",
-    ".juno_task/scripts/release_gate.py", ".juno_task/scripts/release_train.py",
+    ".juno_task/scripts/release_gate.py",
     ".juno_task/scripts/risk_policy.py", ".juno_task/scripts/run_until_completion.sh",
     ".juno_task/scripts/target_runtime_provenance.py",
     ".juno_task/scripts/task_workflow_helper.py", ".juno_task/scripts/task_workspace.py",
@@ -111,7 +111,6 @@ VHC90C_CREATION_PATHS = [
     ".juno_task/scripts/tests/test_managed_agent_runner.py",
     ".juno_task/scripts/tests/test_merge_queue.py",
     ".juno_task/scripts/tests/test_metadata_controller.py",
-    ".juno_task/scripts/tests/test_release_train.py",
     ".juno_task/scripts/tests/test_risk_policy.py",
     ".juno_task/scripts/tests/test_task_workspace.py",
     ".juno_task/scripts/tests/test_task_workspace_decisions.py",
@@ -137,9 +136,9 @@ OITTWR_CREATION_PATHS = [*VHC90C_CREATION_PATHS[:41], "juno_kanban",
                          *VHC90C_CREATION_PATHS[41:]]
 HISTORICAL_CREATION_SHAPES = (
     ("Vhc90c", VHC90C_CREATION_PATHS,
-     "199f964b6100769ed318556f4b77aeb8a4942523d7c6944e476f8ef8bb042ac9"),
+     "9a03ddb75fcd07e7a8600e583de192da02e0394f09a4c53e8b5862f8ed9a4bb8"),
     ("0IttWR", OITTWR_CREATION_PATHS,
-     "f17804f989bbc5549eded74406983cee8c9529638cf2ae4b513b67b29cbbea12"),
+     "7ace90b985ae7fc735b23a9d92c13cbe9070291dc7fa931a0adb64a02dd6f313"),
 )
 
 
@@ -820,6 +819,15 @@ class ValidationProfilesRoundTripTests(unittest.TestCase):
         second = task_runtime.load_config(self.controller)
         self.assertNotIn("validation_profiles", second)
         self.assertEqual(first, second)
+
+    def test_portable_state_workspace_root_uses_environment(self) -> None:
+        config = self.base_config()
+        config["workspace_root"] = "@state/yylo/task-worktrees"
+        self.write_config(config)
+        state_home = self.controller / "state home ü"
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home)}):
+            loaded = task_runtime.load_config(self.controller)
+        self.assertEqual(loaded["workspace_root"], str(state_home / "yylo/task-worktrees"))
 
     def test_authored_profiles_survive_renormalization(self) -> None:
         config = self.base_config()
@@ -1723,136 +1731,12 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
         with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "commit history escaped"):
             task_runtime.build_umbrella_recovery_plan(self.controller, "X", declaration)
 
-    def _contract_body(self, task_id: str, *, owner_decision: bool = False) -> None:
-        decisions = ("\n## Unresolved decisions\n\n- The owner must authorize the release scope before implementation.\n"
-                     if owner_decision else "")
-        task_runtime.task_file(self.controller, task_id).write_text(
-            f"---\nid: {task_id}\nstatus: todo\nlast_modified: '2026-08-20T00:00:00Z'\n---\n"
-            f"\n<!-- juno:body:start -->\n\n## Goal\n\nShip the feature.\n\n"
-            f"## Acceptance\n\n- Focused tests pass.\n- Full suite passes.\n"
-            f"{decisions}\n<!-- juno:body:end -->\n")
-
-    def test_contract_binds_requirements_base_and_reviewer_checklist(self) -> None:
-        self._contract_body("X")
-        task_runtime.start(self.controller, "X")
-        contract = task_runtime.preimplementation_contract(self.controller, "X")
-        self.assertEqual(contract["schema_version"],
-                         task_runtime.PREIMPLEMENTATION_CONTRACT_SCHEMA)
-        self.assertEqual(contract["status"], "ready")
-        self.assertEqual(contract["version"], 1)
-        binding = contract["binding"]
-        self.assertEqual(binding["task_manifest_sha256"],
-                         hashlib.sha256(
-                             task_runtime.task_file(self.controller, "X").read_bytes()
-                         ).hexdigest())
-        self.assertEqual(binding["base_sha"], task_runtime.ref_sha(self.repository, "refs/heads/product"))
-        checklist = contract["reviewer_checklist"]
-        self.assertTrue(any("Focused tests pass" in item for item in checklist))
-        self.assertTrue(contract["contract_path"].endswith("v1.json"))
-        self.assertTrue(Path(contract["contract_path"]).is_file())
-
-    def test_contract_refuses_handoff_while_owner_decisions_open(self) -> None:
-        self._contract_body("X", owner_decision=True)
-        task_runtime.start(self.controller, "X")
-        contract = task_runtime.preimplementation_contract(self.controller, "X")
-        self.assertEqual(contract["status"], "blocked_handoff")
-        self.assertEqual(len(contract["owner_decisions"]), 1)
-        self.assertIn("owner must authorize", contract["owner_decisions"][0])
-
-    def test_contract_supersedes_without_rewriting_the_predecessor(self) -> None:
-        self._contract_body("X")
-        task_runtime.start(self.controller, "X")
-        first = task_runtime.preimplementation_contract(self.controller, "X")
-        first_path = Path(first["contract_path"])
-        first_bytes = first_path.read_bytes()
-        self._contract_body("X")
-        second = task_runtime.preimplementation_contract(self.controller, "X")
-        self.assertEqual(second["version"], 2)
-        self.assertEqual(second["predecessor"]["path"], str(first_path))
-        self.assertEqual(second["predecessor"]["sha256"],
-                         hashlib.sha256(first_bytes).hexdigest())
-        self.assertEqual(first_path.read_bytes(), first_bytes,
-                         "superseding must never rewrite predecessor evidence")
-        active = task_runtime.active_preimplementation_contract(self.controller, "X")
-        assert active is not None
-        self.assertEqual(active["version"], 2)
-
-    def test_contract_parity_pairs_follow_runtime_template_twins(self) -> None:
-        self._contract_body("X")
-        task_runtime.start(self.controller, "X")
-        with task_runtime.state_lock(self.controller):
-            state = task_runtime.read_state(self.controller)
-            state["tasks"]["X"]["changed_paths"] = [
-                ".juno_task/scripts/merge_queue.py",
-                "juno-code/src/templates/scripts/merge_queue.py",
-                "src/feature.txt",
-            ]
-            task_runtime.write_state(self.controller, state)
-        contract = task_runtime.preimplementation_contract(self.controller, "X")
-        pairs = {json.dumps(pair, sort_keys=True) for pair in contract["parity_pairs"]}
-        self.assertIn(json.dumps(
-            {"runtime": ".juno_task/scripts/merge_queue.py",
-             "template": "juno-code/src/templates/scripts/merge_queue.py"}, sort_keys=True), pairs)
-        self.assertEqual(len(contract["parity_pairs"]), 1)
-        self.assertTrue(any("Parity:" in item for item in contract["reviewer_checklist"]))
-
-    def test_handoff_is_deterministic_bounded_and_byte_stable(self) -> None:
-        task_runtime.start(self.controller, "X")
-        first = task_runtime.run_handoff(self.controller, "X")
-        second = task_runtime.run_handoff(self.controller, "X")
-        self.assertEqual(first["schema_version"], task_runtime.HANDOFF_SCHEMA)
-        self.assertEqual(first["state"], "WORKING")
-        self.assertEqual(first["next_command"], "yy task preflight X")
-        self.assertLessEqual(len(first["handoff_text"].encode()),
-                             task_runtime.HANDOFF_MAX_BYTES)
-        markdown = Path(first["handoff_paths"][1])
-        before = markdown.read_bytes()
-        task_runtime.run_handoff(self.controller, "X")
-        self.assertEqual(markdown.read_bytes(), before,
-                         "handoff must be byte-stable without state changes")
-        self.assertIn("[x]", first["handoff_text"])
-        self.assertIn("[>]", first["handoff_text"])
-        self.assertIn("cost/duration: not available", first["handoff_text"])
-
-    def test_handoff_fails_closed_on_conflicting_evidence(self) -> None:
-        task_runtime.start(self.controller, "X")
-        with task_runtime.state_lock(self.controller):
-            state = task_runtime.read_state(self.controller)
-            state["tasks"]["X"]["state"] = "AWAITING_RISK"
-            state["tasks"]["X"]["queue_attempt"] = {"candidate_sha": None,
-                                                    "risk": {"status": "AWAITING_RISK"}}
-            task_runtime.write_state(self.controller, state)
-        handoff = task_runtime.run_handoff(self.controller, "X")
-        self.assertTrue(handoff["conflicts"])
-        self.assertEqual(handoff["next_command"], "yy integration runtime-doctor")
-
-    def test_handoff_maps_lifecycle_states_to_next_commands(self) -> None:
-        task_runtime.start(self.controller, "X")
-        cases = {"QUEUED": "yy merge next",
-                 "AWAITING_RISK": "yy merge review X",
-                 "REVIEW_FINDINGS": "repair findings in the task worktree, then yy merge reopen X",
-                 "RISK_EVIDENCE_READY": "yy merge next X",
-                 "MERGED": "none: task integrated; archive the Kanban task"}
-        for queue_state, command in cases.items():
-            with task_runtime.state_lock(self.controller):
-                state = task_runtime.read_state(self.controller)
-                if queue_state in {"AWAITING_RISK", "RISK_EVIDENCE_READY", "REVIEWING"}:
-                    state["tasks"]["X"]["queue_attempt"] = {
-                        "candidate_sha": "a" * 40,
-                        "risk": {"status": queue_state,
-                                 "review_progress": {"full_suite_admission": {
-                                     "receipts": [{"receipt_path": "/tmp/r.json",
-                                                   "receipt_sha256": "0" * 64}]}}}}
-                elif queue_state == "MERGED":
-                    state["tasks"]["X"]["queue_attempt"] = {"outcome": "MERGED",
-                                                            "candidate_sha": "a" * 40}
-                    state["tasks"]["X"]["outcome"] = "MERGED"
-                else:
-                    state["tasks"]["X"]["queue_attempt"] = {"risk": {"status": queue_state}}
-                state["tasks"]["X"]["state"] = queue_state
-                task_runtime.write_state(self.controller, state)
-            handoff = task_runtime.run_handoff(self.controller, "X")
-            self.assertEqual(handoff["next_command"], command, queue_state)
+    def test_raw_parser_rejects_removed_contract_and_handoff_operations(self) -> None:
+        for operation in ("contract", "handoff"):
+            result = run(["python3", str(SCRIPT), operation, "--task", "X",
+                          "--controller", str(self.controller)], self.controller, False)
+            self.assertEqual(result.returncode, 2, operation)
+            self.assertIn("invalid choice", result.stderr, operation)
 
     def test_recovery_plan_audit_requires_kanban_routing_policy(self) -> None:
         self.payload("start", "X")
@@ -1873,6 +1757,38 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
         }, clear=False):
             with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "expected kanban"):
                 task_runtime.record_control_audit(self.controller, "task", "recovery-plan", "X")
+
+    def test_merge_lifecycle_supersession_audit_is_canonical_and_unknown_still_refuses(self) -> None:
+        with mock.patch.dict(os.environ, {
+            "JUNO_CONTROL_INVOCATION_ROOT": str(self.controller),
+            "JUNO_CONTROL_INVOCATION_ROLE": "controller",
+            "JUNO_CONTROL_EFFECTIVE_ROOT": str(self.controller),
+            "JUNO_CONTROL_OPERATION": "orchestration",
+        }, clear=False):
+            reference = task_runtime.record_control_audit(
+                self.controller, "merge", "supersede-lifecycle-journal", "WxK4xy")
+            with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                        "unsupported merge audit operation"):
+                task_runtime.record_control_audit(
+                    self.controller, "merge", "supersede-unknown-journal", None)
+        receipt = json.loads(Path(reference["path"]).read_text())
+        self.assertEqual((receipt["surface"], receipt["operation"],
+                          receipt["policy_operation"], receipt["task_id"]),
+                         ("merge", "supersede-lifecycle-journal", "orchestration", "WxK4xy"))
+    def test_merge_recover_authority_drift_audit_is_exact_and_unknown_operations_refuse(self) -> None:
+        audit_root = self.controller / ".juno_task/runtime/control-audit/merge"
+        receipt = task_runtime.record_control_audit(
+            self.controller, "merge", "recover-authority-drift", "X")
+        audit = json.loads(Path(receipt["path"]).read_text())
+        self.assertEqual((audit["surface"], audit["operation"], audit["task_id"],
+                          audit["policy_operation"]),
+                         ("merge", "recover-authority-drift", "X", "orchestration"))
+        before = sorted(audit_root.glob("*.json"))
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                    "unsupported merge audit operation: recover-authority-drift-unknown"):
+            task_runtime.record_control_audit(
+                self.controller, "merge", "recover-authority-drift-unknown", "X")
+        self.assertEqual(sorted(audit_root.glob("*.json")), before)
 
     def test_clean_working_umbrella_recovery_preserves_predecessor_and_is_idempotent(self) -> None:
         declaration = self.umbrella_fixture()
@@ -2376,6 +2292,29 @@ class TaskWorkspaceTests(TaskWorkspaceFixture):
         self.assertTrue((self.workspaces / "X" / "optional/base.txt").is_file())
         with self.assertRaisesRegex(task_runtime.TaskWorkspaceError, "differ from the frozen"):
             task_runtime.start(self.controller, "X", [])
+
+    def test_start_freezes_exact_tracked_files_without_legacy_baseline_roots(self) -> None:
+        started = task_runtime.start(self.controller, "X", ["src/base.txt"])
+        receipt = started["creation_receipt"]
+        self.assertEqual(receipt["requested_paths"], ["src/base.txt"])
+        self.assertEqual(receipt["allowed_paths"], ["src/base.txt"])
+        self.assertEqual(receipt["selected_entries"]["src/base.txt"]["type"], "blob")
+        self.assertNotIn("src", receipt["allowed_paths"])
+
+    def test_early_admission_projects_dirty_and_committed_authored_paths_read_only(self) -> None:
+        started = task_runtime.start(self.controller, "X", ["src/base.txt"])
+        worktree = Path(started["worktree"])
+        (worktree / "src/base.txt").write_text("changed\n")
+        dirty = task_runtime.task_admission_check(self.controller, "X")
+        self.assertEqual(dirty["dirty_paths"], ["src/base.txt"])
+        self.assertEqual(dirty["authored_paths"], [])
+        git(worktree, "add", "src/base.txt")
+        git(worktree, "commit", "-m", "exact authored file")
+        committed = task_runtime.task_admission_check(self.controller, "X")
+        self.assertEqual(committed["dirty_paths"], [])
+        self.assertEqual(committed["authored_paths"], ["src/base.txt"])
+        self.assertEqual(committed["origin_projection"]["schema_version"],
+                         "juno_path_origin_projection.v1")
 
     def test_exact_runtime_parity_paths_queue_with_their_package_templates(self) -> None:
         policy_path = self.controller / ".juno_task/config/task-workspace.json"
@@ -4346,12 +4285,21 @@ raise SystemExit(2)
         self.assertEqual(checked["outcome"], "preflight_passed")
         self.assertEqual(closure["tip_sha"], tip)
         self.assertEqual(closure["changed_paths"], ["src/feature.txt"])
+        submission = closure["submission"]
+        submission_body = {key: value for key, value in submission.items()
+                           if key != "submission_sha256"}
+        self.assertEqual(submission["submission_sha256"],
+                         task_runtime.stable_sha256(submission_body))
+        self.assertTrue(Path(checked["submission_receipt"]["path"]).is_file())
         body = {key: value for key, value in closure.items() if key != "closure_sha256"}
         self.assertEqual(closure["closure_sha256"], task_runtime.stable_sha256(body))
         self.assertEqual(task_runtime.read_state(self.controller)["tasks"]["X"]["state"],
                          "WORKING")
         queued = self.payload("finish", "X")
         queued_closure = queued["review_ready_closure"]
+        self.assertEqual(checked["submission_receipt"], queued["submission_receipt"])
+        self.assertEqual(submission["submission_sha256"],
+                         queued_closure["submission"]["submission_sha256"])
         for key, value in closure.items():
             if key != "closure_sha256":
                 self.assertEqual(queued_closure[key], value)
@@ -4362,6 +4310,18 @@ raise SystemExit(2)
                        if key != "closure_sha256"}
         self.assertEqual(queued_closure["closure_sha256"],
                          task_runtime.stable_sha256(queued_body))
+
+    def test_unrelated_target_advance_reuses_the_same_semantic_submission(self) -> None:
+        self.payload("start", "X")
+        self.commit_task("X")
+        checked = self.payload("preflight", "X")
+        self.advance_target()
+        queued = self.payload("finish", "X")
+        self.assertEqual(
+            checked["review_ready_closure"]["submission"]["submission_sha256"],
+            queued["review_ready_closure"]["submission"]["submission_sha256"],
+        )
+        self.assertEqual(checked["submission_receipt"], queued["submission_receipt"])
 
     def test_finish_refuses_failed_focused_validation_without_state_advance(self) -> None:
         self.payload("start", "X")
@@ -4702,6 +4662,35 @@ finished = time.monotonic()
         self.assertEqual(finished["validation_routing"],
                          {"mode": "profile", "profile_ids": ["pkg-suite"],
                           "authored_path_count": 1})
+
+    def test_absent_allowed_root_is_creatable_and_selects_only_its_profile(self) -> None:
+        config_path = self.controller / ".juno_task/config/task-workspace.json"
+        config = json.loads(config_path.read_text())
+        config["allowed_paths"].append("telegram_bot")
+        config["validation_profiles"] = [{
+            "id": "telegram-bot-suite", "path_roots": ["telegram_bot"],
+            "commands": [{"id": "telegram-bot-test", "cwd": "telegram_bot",
+                          "argv": [sys.executable, "-c", "pass"],
+                          "timeout_seconds": 10, "max_output_bytes": 4096,
+                          "input_paths": ["telegram_bot"]}],
+        }]
+        config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+        started = self.payload("start", "X")
+        self.assertIn("telegram_bot", started["creation_receipt"]["allowed_paths"])
+        worktree = self.workspaces / "X"
+        (worktree / "telegram_bot").mkdir()
+        (worktree / "telegram_bot/app.py").write_text("VALUE = 1\n")
+        git(worktree, "add", "telegram_bot/app.py")
+        git(worktree, "commit", "-m", "create newly admitted root")
+        finished = self.payload("finish", "X")
+        self.assertEqual([row["id"] for row in finished["validation"]],
+                         ["telegram-bot-test"])
+        self.assertEqual(finished["validation_routing"]["profile_ids"],
+                         ["telegram-bot-suite"])
+
+        self.assertFalse(task_runtime.path_within("unrelated_root/file.py",
+                                                  started["creation_receipt"]["allowed_paths"]))
 
     def test_task_run_persists_needs_decision_before_product_editing(self) -> None:
         self.install_task_run_assets()
@@ -6182,11 +6171,8 @@ steps:
                       f"superseded-by-{repaired['plan_sha256']}.json")
         self.assertEqual(json.loads(superseded.read_text())["outcome"], "SUPERSEDED")
 
-    def test_failed_evidence_with_changed_readiness_reexecutes_via_supersession(self) -> None:
-        """Regression (Yx60Pf): a failed focused-validation receipt whose
-        readiness identity then changed must re-execute under its one
-        supersession and persist the supersession receipt instead of raising
-        FileNotFoundError for a receipt that was never written."""
+    def test_failed_exact_command_stands_when_only_legacy_readiness_wrapper_changes(self) -> None:
+        """D owns one terminal result; G, not readiness wrappers, owns retries."""
         counter = self.root / "standing-counter.txt"
         repair = self.root / "repair.flag"
         code = ("from pathlib import Path\n"
@@ -6207,23 +6193,16 @@ steps:
             **hydration, "yy60pf_readiness_marker": "repaired-environment"}
         state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
         repair.write_text("ready\n")
-        summary = self.payload("evidence-run", "X")
-        self.assertEqual((summary["outcome"], summary["executed"], summary["invalidated"]),
-                         ("PASSED", 1, 1))
-        self.assertEqual(counter.read_text().splitlines(), ["run", "run"])
-        self.assertEqual([item["decision"] for item in summary["decisions"]],
-                         ["invalidated", "executed"])
-        root = self.controller / task_runtime.STANDING_ROOT / "X" / plan["plan_sha256"]
-        receipts = sorted(root.glob("command-0-*.json"))
-        self.assertEqual(len(receipts), 2)
-        supersession = [path for path in receipts if ".readiness-" in path.name]
-        original = [path for path in receipts if ".readiness-" not in path.name]
-        self.assertEqual((len(supersession), len(original)), (1, 1))
-        rerun = json.loads(supersession[0].read_text())
-        failed = json.loads(original[0].read_text())
-        self.assertEqual(rerun["result"]["exit_code"], 0)
+        with self.assertRaisesRegex(AssertionError, "focused validation failed"):
+            self.command("evidence-run", "X")
+        self.assertEqual(counter.read_text().splitlines(), ["run"])
+        canonical = list((self.controller / task_runtime.CANONICAL_VALIDATION_ROOT).rglob("result.json"))
+        self.assertEqual(len(canonical), 1)
+        failed = json.loads(canonical[0].read_text())
+        self.assertEqual(failed["outcome_identity"]["verdict"], "FAILED")
         self.assertEqual(failed["result"]["exit_code"], 3)
-        self.assertNotEqual(rerun["readiness_sha256"], failed["readiness_sha256"])
+        root = self.controller / task_runtime.STANDING_ROOT / "X" / plan["plan_sha256"]
+        self.assertEqual(list(root.glob("command-0-*.readiness-*.json")), [])
 
     # --- Receipt-bound projection of durable lifecycle truth onto the board ---
 
@@ -6483,6 +6462,29 @@ steps:
         self.assertEqual(recovered["outcome"], "projected")
         self.assertEqual(self.board_task("X")["status"], "in_progress")
 
+    def test_merge_recover_authority_drift_audit_is_exact_and_unknown_operations_refuse(self) -> None:
+        audit_root = self.controller / ".juno_task/runtime/control-audit/merge"
+        repair_receipt = task_runtime.record_control_audit(
+            self.controller, "merge", "recover-full-suite-failure", "X")
+        repair_payload = json.loads(Path(repair_receipt["path"]).read_text())
+        self.assertEqual(
+            (repair_payload["surface"], repair_payload["operation"],
+             repair_payload["task_id"], repair_payload["policy_operation"]),
+            ("merge", "recover-full-suite-failure", "X", "orchestration"))
+        receipt = task_runtime.record_control_audit(
+            self.controller, "merge", "recover-authority-drift", "X")
+        audit = json.loads(Path(receipt["path"]).read_text())
+        self.assertEqual((audit["surface"], audit["operation"], audit["task_id"],
+                          audit["policy_operation"]),
+                         ("merge", "recover-authority-drift", "X", "orchestration"))
+        before = sorted(audit_root.glob("*.json"))
+        with self.assertRaisesRegex(task_runtime.TaskWorkspaceError,
+                                    "unsupported merge audit operation: recover-authority-drift-unknown"):
+            task_runtime.record_control_audit(
+                self.controller, "merge", "recover-authority-drift-unknown", "X")
+        self.assertEqual(sorted(audit_root.glob("*.json")), before)
+
+
 
 class TaskFencingLeaseTests(TaskWorkspaceFixture):
     """Real-Git/process scenarios for fenced task/worktree attempts (rrx4b8).
@@ -6649,16 +6651,26 @@ class TaskFencingLeaseTests(TaskWorkspaceFixture):
         queued = self.payload("finish", "X")
         self.assertEqual(queued["state"], "QUEUED")
 
-    def test_dirty_worktree_successor_preserves_recovery_packet(self) -> None:
+    def test_dirty_worktree_successor_preserves_recovery_packet_and_routes_to_status(self) -> None:
         self.payload("start", "X")
         worktree = self.workspaces / "X"
+        (worktree / "src/committed.txt").write_text("committed bytes\n")
+        git(worktree, "add", "src/committed.txt")
+        git(worktree, "commit", "-m", "committed recovery evidence")
         (worktree / "src/uncommitted.txt").write_text("dirty bytes\n")
+        before = self.payload("status", "X")
+        self.assertEqual(before["changed_paths"], ["src/committed.txt"])
+        self.assertEqual(before["uncommitted_paths"], ["src/uncommitted.txt"])
         successor = self.payload("lease-successor", "X")
         recovery = successor["recovery"]
         self.assertEqual(recovery["classification"], "dirty_recovery_required")
         self.assertEqual(recovery["dirty_paths"], ["src/uncommitted.txt"])
+        self.assertEqual(recovery["next_command"], "yy task status X")
         self.assertIn("preserved", json.dumps(recovery))
-        # The dirty bytes survive successor issuance untouched.
+        # Successor issuance mutates neither committed nor uncommitted task bytes.
+        after = self.payload("status", "X")
+        self.assertEqual(after["changed_paths"], ["src/committed.txt"])
+        self.assertEqual(after["uncommitted_paths"], ["src/uncommitted.txt"])
         self.assertEqual((worktree / "src/uncommitted.txt").read_text(), "dirty bytes\n")
         lease = self.fencing_record("X")
         self.assertEqual(lease["recovery"]["classification"], "dirty_recovery_required")
@@ -6972,6 +6984,49 @@ class MinimumRcLifecycleContractTests(unittest.TestCase):
             phase="successor_attempt")
         self.assertEqual(trace["restart_stage"], "VALIDATING")
         self.assertEqual(trace["counters"]["invalidated"], 1)
+
+    def test_canonical_command_index_executes_once_and_invalidates_each_identity(self) -> None:
+        lifecycle = task_runtime.lifecycle_runtime
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True,
+                           stdout=subprocess.DEVNULL)
+            root = Path(temporary) / "index"
+            calls = []
+            body = {"schema_version": lifecycle.COMMAND_CLOSURE_SCHEMA,
+                    "command": {"id": "suite", "cwd": "pkg", "argv": ["npm", "test"]},
+                    "observable_tree": "a" * 40, "dependency_locks": {"lock": "b" * 40},
+                    "runtime_sha256": "c" * 64, "environment": {"CI": "1"}}
+            closure = {**body, "input_closure_sha256": lifecycle.digest(body)}
+
+            def execute() -> dict:
+                calls.append("run")
+                return {"exit_code": 0, "timed_out": False, "cancelled": False,
+                        "result_integrity": {"eligible_pass": True}}
+
+            first = lifecycle.consume_or_execute_command_result(
+                root, repository, closure, execute, phase="task_closure", task_id="T")
+            second = lifecycle.consume_or_execute_command_result(
+                root, repository, closure, execute, phase="merge_validation", task_id="T")
+            self.assertEqual(([first["decision"], second["decision"]], calls),
+                             (["executed", "reused"], ["run"]))
+            self.assertEqual(first["reference"], second["reference"])
+            drifted_body = {**body, "environment": {"CI": "0"}}
+            drifted = {**drifted_body,
+                       "input_closure_sha256": lifecycle.digest(drifted_body)}
+            third = lifecycle.consume_or_execute_command_result(
+                root, repository, drifted, execute, phase="merge_validation", task_id="T")
+            self.assertEqual((third["decision"], calls), ("executed", ["run", "run"]))
+            path = Path(first["reference"]["path"])
+            tampered = json.loads(path.read_text())
+            tampered["result"]["exit_code"] = 7
+            path.write_text(json.dumps(tampered) + "\n")
+            with self.assertRaisesRegex(lifecycle.LifecycleContractError,
+                                        "canonical command result"):
+                lifecycle.consume_or_execute_command_result(
+                    root, repository, closure, execute, phase="merge_validation", task_id="T")
+            self.assertEqual(calls, ["run", "run"])
 
     def test_profile_closure_is_package_local_deterministic_and_attributes_changed_inputs(self) -> None:
         lifecycle = task_runtime.lifecycle_runtime

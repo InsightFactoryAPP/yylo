@@ -61,6 +61,9 @@ afterEach(async () => {
 describe('merge queue CLI', () => {
   it.each([
     { argv: ['status'], expected: ['status'] },
+    { argv: ['status', '--detail', 'T123'], expected: ['status', undefined, ['--detail', 'T123']] },
+    { argv: ['status', '--detail'], expected: ['status', undefined, ['--detail']] },
+    { argv: ['status', '--full'], expected: ['status', undefined, ['--full']] },
     { argv: ['next'], expected: ['next'] },
     { argv: ['next', 'T123'], expected: ['next', 'T123'] },
     { argv: ['resolve', 'T123'], expected: ['resolve', 'T123'] },
@@ -74,6 +77,59 @@ describe('merge queue CLI', () => {
     await program.parseAsync(['node', 'yy', 'merge', ...argv]);
     expect(invoke).toHaveBeenCalledOnce();
     expect(invoke).toHaveBeenCalledWith(...expected);
+  });
+
+  it('forwards every exact deterministic full-suite repair identity', async () => {
+    const invoke = vi.fn(async () => undefined);
+    const program = new Command().exitOverride();
+    configureMergeQueueCommand(program, invoke);
+    const args = ['--attempt', '231', '--terminal-receipt', '/attempt-231-failed.json',
+      '--terminal-receipt-sha256', 'a'.repeat(64), '--expected-revision', 'b'.repeat(64),
+      '--run-id', '1788481850518348000-e36d9830ea1a078f', '--scope-sha256', 'c'.repeat(64),
+      '--journal-sha256', 'd'.repeat(64)];
+    await program.parseAsync(['node', 'yy', 'merge', 'recover-full-suite-failure', 'T123', ...args]);
+    expect(invoke).toHaveBeenCalledWith('recover-full-suite-failure', 'T123', args);
+  });
+
+  it('forwards every exact semantic-repair pre-dispatch recovery identity', async () => {
+    const invoke = vi.fn(async () => undefined);
+    const program = new Command().exitOverride();
+    configureMergeQueueCommand(program, invoke);
+    const args = ['--attempt', '232', '--terminal-receipt', '/attempt-232-failed.json',
+      '--terminal-receipt-sha256', 'a'.repeat(64), '--expected-revision', 'b'.repeat(64),
+      '--run-id', '1788481850518348000-e36d9830ea1a078f', '--scope-sha256', 'c'.repeat(64),
+      '--journal-sha256', 'd'.repeat(64), '--worker-id', 'semantic-repair-0001',
+      '--predispatch-receipt', '/controller-predispatch-receipt.json',
+      '--predispatch-receipt-sha256', 'e'.repeat(64)];
+    await program.parseAsync(['node', 'yy', 'merge', 'recover-repair-predispatch', 'T123', ...args]);
+    expect(invoke).toHaveBeenCalledWith('recover-repair-predispatch', 'T123', args);
+  });
+
+  it('forwards every exact authority-drift recovery identity', async () => {
+    const invoke = vi.fn(async () => undefined);
+    const program = new Command().exitOverride();
+    configureMergeQueueCommand(program, invoke);
+    await program.parseAsync(['node', 'yy', 'merge', 'recover-authority-drift', 'T123',
+      '--attempt', '225', '--terminal-receipt', '/attempt-225-failed.json',
+      '--terminal-receipt-sha256', 'abc', '--expected-revision', 'def']);
+    expect(invoke).toHaveBeenCalledWith('recover-authority-drift', 'T123', [
+      '--attempt', '225', '--terminal-receipt', '/attempt-225-failed.json',
+      '--terminal-receipt-sha256', 'abc', '--expected-revision', 'def']);
+  });
+
+  it('forwards every exact stale-lifecycle supersession identity', async () => {
+    const invoke = vi.fn(async () => undefined);
+    const program = new Command().exitOverride();
+    configureMergeQueueCommand(program, invoke);
+    const options = ['--run-id', '1788467754907264000-b5fa7b4da494425e',
+      '--expected-journal-revision', '7', '--expected-journal-sha256', 'a'.repeat(64),
+      '--scope-sha256', 'b'.repeat(64), '--arbiter-attempt', '227',
+      '--terminal-receipt', '/terminal.json', '--terminal-receipt-sha256', 'c'.repeat(64),
+      '--recovered-task', 'WxK4xy', '--recovery-receipt', '/recovery.json',
+      '--recovery-receipt-sha256', 'd'.repeat(64), '--expected-target-sha', 'e'.repeat(40),
+      '--expected-current-fifo-sha256', 'f'.repeat(64)];
+    await program.parseAsync(['node', 'yy', 'merge', 'supersede-lifecycle-journal', ...options]);
+    expect(invoke).toHaveBeenCalledWith('supersede-lifecycle-journal', undefined, options);
   });
 
   it('forwards merge drive with an optional frozen FIFO stop boundary', async () => {
@@ -95,20 +151,18 @@ describe('merge queue CLI', () => {
     expect(invoke).toHaveBeenCalledWith('arbiter-run', undefined, ['--through', 'T123']);
   });
 
-  it('forwards stable plan projection and stale-plan execution options', async () => {
+  it('forwards stable plan projection and ordinary execution options', async () => {
     const invoke = vi.fn(async () => undefined);
     const program = new Command().exitOverride();
     configureMergeQueueCommand(program, invoke);
     await program.parseAsync(['node', 'yy', 'merge', 'plan', 'T123', '--against', 'HEAD', '--json']);
     expect(invoke).toHaveBeenCalledWith('plan', 'T123', ['--against', 'HEAD', '--json']);
     invoke.mockClear();
-    await program.parseAsync(['node', 'yy', 'merge', 'resolve', 'T123', '--plan-id', 'abc',
-      '--train-plan', '/train-plan.json']);
-    expect(invoke).toHaveBeenCalledWith('resolve', 'T123', ['--plan-id', 'abc',
-      '--train-plan', '/train-plan.json']);
+    await program.parseAsync(['node', 'yy', 'merge', 'resolve', 'T123', '--plan-id', 'abc']);
+    expect(invoke).toHaveBeenCalledWith('resolve', 'T123', ['--plan-id', 'abc']);
     invoke.mockClear();
-    await program.parseAsync(['node', 'yy', 'merge', 'next', '--train-plan', '/train-plan.json']);
-    expect(invoke).toHaveBeenCalledWith('next', undefined, ['--train-plan', '/train-plan.json']);
+    await program.parseAsync(['node', 'yy', 'merge', 'next']);
+    expect(invoke).toHaveBeenCalledWith('next');
     invoke.mockClear();
     await program.parseAsync(['node', 'yy', 'merge', 'reconcile', 'plan', 'T123']);
     expect(invoke).toHaveBeenCalledWith('reconcile', undefined, ['plan', 'T123']);
@@ -125,13 +179,20 @@ describe('merge queue CLI', () => {
       '--receipt', '/receipt.json', '--receipt-sha256', 'abc']);
     expect(invoke).toHaveBeenCalledWith('refresh', undefined,
       ['apply', 'T123', '--receipt', '/receipt.json', '--receipt-sha256', 'abc']);
+    invoke.mockClear();
+    await program.parseAsync(['node', 'yy', 'merge', 'recover-authority-drift', 'T123',
+      '--attempt', '225', '--terminal-receipt', '/attempt-225-failed.json',
+      '--terminal-receipt-sha256', 'abc', '--expected-revision', 'def']);
+    expect(invoke).toHaveBeenCalledWith('recover-authority-drift', 'T123', [
+      '--attempt', '225', '--terminal-receipt', '/attempt-225-failed.json',
+      '--terminal-receipt-sha256', 'abc', '--expected-revision', 'def']);
   });
 
-  it('keeps next TASK_ID optional and requires it for plan, resolve, review, and reopen', () => {
+  it('keeps next TASK_ID optional and requires task identity for recovery mutations', () => {
     const program = new Command();
     configureMergeQueueCommand(program, async () => undefined);
     const merge = program.commands.find((command) => command.name() === 'merge');
-    expect(merge?.commands.map((command) => command.name())).toEqual(['status', 'drive', 'arbiter', 'plan', 'next', 'resolve', 'review', 'reopen', 'withdraw', 'reconcile', 'refresh']);
+    expect(merge?.commands.map((command) => command.name())).toEqual(['status', 'drive', 'arbiter', 'plan', 'next', 'resolve', 'review', 'reopen', 'recover-full-suite-failure', 'recover-repair-predispatch', 'recover-authority-drift', 'supersede-lifecycle-journal', 'withdraw', 'reconcile', 'refresh']);
     expect(merge?.commands[0]?.registeredArguments).toHaveLength(0);
     expect(merge?.commands[1]?.registeredArguments).toHaveLength(0);
     expect(merge?.commands[3]?.registeredArguments[0]?.required).toBe(true);
@@ -139,7 +200,10 @@ describe('merge queue CLI', () => {
     expect(merge?.commands[5]?.registeredArguments[0]?.required).toBe(true);
     expect(merge?.commands[6]?.registeredArguments[0]?.required).toBe(true);
     expect(merge?.commands[7]?.registeredArguments[0]?.required).toBe(true);
-    expect(merge?.commands[7]?.registeredArguments[0]?.required).toBe(true);
+    expect(merge?.commands[8]?.registeredArguments[0]?.required).toBe(true);
+    expect(merge?.commands[9]?.registeredArguments[0]?.required).toBe(true);
+    expect(merge?.commands[10]?.registeredArguments[0]?.required).toBe(true);
+    expect(merge?.commands[11]?.registeredArguments).toHaveLength(0);
   });
 
   it('forwards the bounded withdraw operator reason', async () => {
@@ -165,12 +229,23 @@ describe('merge queue CLI', () => {
     const arbiter = command('arbiter');
     const arbiterCommand = (name: string) => arbiter?.commands.find((entry) => entry.name() === name);
     expect(command('status')?.description()).toContain('Read-only');
+    expect(command('status')?.description()).toContain('bounded');
+    expect(command('status')?.options.map((option) => option.long)).toEqual([
+      '--detail', '--full', '--json',
+    ]);
     expect(arbiterCommand('status')?.description()).toContain('Read-only');
     expect(arbiterCommand('run')?.description()).toContain('Explicit mutation');
     expect(command('next')?.description()).toContain('Explicit recovery mutation');
     expect(command('next')?.description()).toContain('continue paused evidence');
     expect(command('next')?.registeredArguments[0]?.description).toContain('evidence/review');
     expect(command('resolve')?.description()).toContain('Explicit recovery mutation');
+    expect(command('recover-full-suite-failure')?.description()).toContain('receipt-bound');
+    expect(command('recover-full-suite-failure')?.description()).toContain('one deterministic');
+    expect(command('recover-repair-predispatch')?.description()).toContain('Receipt-bound');
+    expect(command('recover-repair-predispatch')?.description()).toContain('exact existing');
+    expect(command('recover-authority-drift')?.description()).toContain('receipt-bound recovery');
+    expect(command('recover-authority-drift')?.description()).toContain('pre-CAS');
+    expect(command('supersede-lifecycle-journal')?.description()).toContain('Terminalize');
   });
 
   it('checkpoints only after successful terminal merge and Kanban finalization truth', async () => {
