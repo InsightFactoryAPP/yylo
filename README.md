@@ -1,6 +1,6 @@
 # YYLO CLI
 
-[![Mentioned in Awesome Coding Agents](https://awesome.re/mentioned-badge.svg)](https://github.com/kailiu42/awesome-coding-agents) [![Mentioned in Awesome Gemini CLI](https://awesome.re/mentioned-badge.svg)](https://github.com/Piebald-AI/awesome-gemini-cli)
+[![Mentioned in Awesome Coding Agents](https://awesome.re/mentioned-badge.svg)](https://github.com/kailiu42/awesome-coding-agents) [![Mentioned in Awesome Gemini CLI](https://awesome.re/mentioned-badge.svg)](https://github.com/Piebald-AI/awesome-gemini-cli) [![Mentioned in Awesome Collective AI Tools](https://awesome.re/mentioned-badge.svg)](https://github.com/hanishrao/collective-ai-tools)
 
 YYLO is a command-line orchestrator for coding agents, repeatable workflows, and receipt-backed repository changes. It is for developers who want a quick agent loop and for project operators who need typed task, validation, merge, and release-readiness boundaries.
 
