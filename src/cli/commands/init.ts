@@ -19,6 +19,11 @@ import type { InitCommandOptions } from '../types.js';
 import type { SubagentType } from '../../types/index.js';
 import { ValidationError } from '../types.js';
 import { buildChildProcessEnvironment } from '../../core/child-process-environment.js';
+import {
+  establishFreshInitTopology,
+  installedCliVersion,
+  probeFreshInitTopology,
+} from '../../utils/fresh-init-topology.js';
 
 /** Simple key-value variables for template interpolation */
 interface InitVariables {
@@ -208,6 +213,7 @@ class SimpleProjectGenerator {
 
   async generate(): Promise<void> {
     const { targetDirectory, variables, force } = this.context;
+    const freshTopology = probeFreshInitTopology(targetDirectory);
 
     console.log(chalk.blue('📁 Creating project directory...'));
 
@@ -581,8 +587,17 @@ ${variables.EDITOR ? `using ${variables.EDITOR} as primary AI subagent` : ''}
     console.log(chalk.blue('🐍 Installing Python requirements...'));
     await this.executeInstallRequirements(junoTaskDir);
 
-    // Set up Git repository if Git URL is provided
-    await this.setupGitRepository();
+    // Set up Git repository if Git URL is provided. A fresh unborn repository
+    // is committed exactly once by the topology bootstrap below.
+    await this.setupGitRepository(freshTopology.eligible);
+
+    const topology = freshTopology.eligible
+      ? await establishFreshInitTopology(freshTopology, await installedCliVersion())
+      : { configured: false, integrationOwner: null };
+    if (topology.configured) {
+      console.log(chalk.green('   ✓ Configured controller and protected integration owner'));
+      console.log(chalk.dim(`   Integration owner: ${topology.integrationOwner}`));
+    }
 
     console.log(chalk.green.bold('\n✅ Project initialization complete!'));
     this.printNextSteps(targetDirectory, String(variables.EDITOR || 'claude'));
@@ -688,6 +703,8 @@ ${variables.EDITOR ? `using ${variables.EDITOR} as primary AI subagent` : ''}
         // Only copy files (not directories)
         const stats = await fs.stat(sourcePath);
         if (stats.isFile()) {
+          const sourceContent = await fs.readFile(sourcePath, 'utf8');
+          if (sourceContent.startsWith('# Retired')) continue;
           await fs.copy(sourcePath, destPath);
 
           // Set executable permissions (chmod +x) for .sh files
@@ -824,7 +841,7 @@ ${variables.EDITOR ? `using ${variables.EDITOR} as primary AI subagent` : ''}
   /**
    * Initialize Git repository and set up remote if Git URL is provided
    */
-  private async setupGitRepository(): Promise<void> {
+  private async setupGitRepository(skipInitialCommit = false): Promise<void> {
     if (!this.context.gitUrl) {
       return; // No Git URL provided, skip Git setup
     }
@@ -896,7 +913,7 @@ ${variables.EDITOR ? `using ${variables.EDITOR} as primary AI subagent` : ''}
           hasCommits = false;
         }
 
-        if (!hasCommits) {
+        if (!hasCommits && !skipInitialCommit) {
           // Add all files and create initial commit
           execSync('git add .', { cwd: targetDirectory, stdio: 'ignore' });
 
@@ -1430,7 +1447,7 @@ function generateAgentDocContent(
 
 ## Kanban Task Management
 
-For comprehensive kanban usage (all commands, dependency management, best practices), use the \`kanban-workflow\` skill.
+For comprehensive kanban usage (all commands, dependency management, best practices), use the \`ledger-tasks-yylo\` skill.
 
 \`\`\`bash
 # List tasks

@@ -23,7 +23,7 @@ yy init --task "Document the onboarding path" --subagent pi
 yy watch exec pwd
 ```
 
-A successful run prints the installed YYLO version, initializes `.juno_task/`, then emits a watch receipt with `"state":"COMPLETED"`, `"exit_code":0`, and nonzero `log_bytes`. This canary does not contact a model provider.
+A successful run prints the installed YYLO version, initializes `.juno_task/`, then emits a watch receipt with `"state":"COMPLETED"`, `"exit_code":0`, and nonzero `log_bytes`. This canary does not contact a model provider. In an empty, unborn Git repository, `yy init` creates the initial workspace commit, keeps the original branch as the product target, and creates a detached protected integration-owner worktree under the user state directory. Existing or dirty repositories are never committed or rearranged by this bootstrap.
 
 Inspect the initialized workspace and exact command surface:
 
@@ -45,8 +45,8 @@ npm install --global '@yylo/cli@latest'
 
 # Explicit prerelease
 npm install --global '@yylo/cli@next'
-# Exact version for reproducible installs
-npm install -g @yylo/cli@0.2.2
+# Exact local/prerelease candidate for reproducible installs
+npm install -g @yylo/cli@0.2.3-rc.1
 
 npm view '@yylo/cli' version dist-tags --json
 yy --version
@@ -66,17 +66,21 @@ stable version:
 
 ```bash
 yy skills install
-yy skills install --version 1.0.0
+yy skills install --version 2.0.0
 yy skills update --force
 yy skills status
 ```
 
 Only `skills install` and `skills update` access the network. Acquisition is
 staged through `npx skills add` first and falls back to a shallow exact-tag Git
-clone. The four canonical skills are copied to `.agents/skills`,
-`.claude/skills`, and `.pi/skills`. Differing YYLO skill directories are refused
-unless `--force` is supplied; unrelated skills are preserved. `skills list` and
-`skills status` use only the local install record.
+clone. The seven user-intent-first skills (`artifact-yylo`, `ledger-tasks-yylo`,
+`plan-ledger-tasks-yylo`, `ralph-loop-yylo`, `understand-project-yylo`,
+`wiki-yylo`, and `workflow-yylo`) are copied to `.agents/skills`,
+`.claude/skills`, and `.pi/skills`. Differing canonical directories are refused
+unless `--force` is supplied. An explicit install/update retires a legacy YYLO
+skill only when its local install record and current digest prove it unchanged;
+customized legacy and unrelated skills are preserved with a warning. `skills
+list` and `skills status` use only the local install record.
 
 ## What YYLO owns
 
@@ -376,7 +380,7 @@ Install canonical packages independently:
 
 ```bash
 python3 -m pip install 'yylo-ledger==0.2.0'
-npm install --global '@yylo/benchmark@0.1.0-rc.1'
+npm install --global '@yylo/benchmark@0.1.1-rc.1'
 
 yylo-ledger --help
 yy ledger --help
