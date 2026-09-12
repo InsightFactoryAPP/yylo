@@ -31,6 +31,7 @@ import {
   formatExplicitInvocationError,
 } from '../utils/explicit-command.js';
 import { migrateLegacyEnvironment } from '../core/identity-migration.js';
+import { writeCurrentMachineError } from '../cli/machine-output.js';
 
 const executableLaunchSurface = (() => {
   const executable = basename(process.argv0);
@@ -88,7 +89,7 @@ import { createSkillsCommand } from '../cli/commands/skills.js';
 import { createAuthCommand } from '../cli/commands/auth.js';
 import { configureTaskWorkspaceCommand } from '../cli/commands/task.js';
 import { configureIntegrationCommand } from '../cli/commands/integration.js';
-import { configureMergeQueueCommand } from '../cli/commands/merge.js';
+import { configureMergeCommand } from '../cli/commands/merge.js';
 import { configureWatchCommand } from '../cli/commands/watch.js';
 import { configureEvidenceCommand } from '../cli/commands/evidence.js';
 import { configureKanbanCommand } from '../cli/commands/kanban.js';
@@ -96,6 +97,8 @@ import { configureMigrationCommand } from '../cli/commands/migrate.js';
 import { configureWorkspaceCommands } from '../cli/commands/workspace.js';
 import { configureWikiCommand } from '../cli/commands/wiki.js';
 import { configureLoopCommand } from '../cli/commands/loop.js';
+import { configureCapabilitiesCommand } from '../cli/commands/capabilities.js';
+import { configureTmuxCommand } from '../cli/commands/tmux.js';
 import {
   configureBenchmarkCommand,
   forwardBenchmarkSignal,
@@ -211,6 +214,26 @@ function isConnectionLikeError(err: unknown): boolean {
 /**
  * Global error handler for CLI operations
  */
+function writeSelectedMachineError(error: unknown, exitCode: number): void {
+  if (writeCurrentMachineError(error, exitCode)) return;
+  if (!process.argv.includes('--execution-envelope')) return;
+  process.stdout.write(`${JSON.stringify({
+    schema_version: 'juno_execution_envelope.v1',
+    command: { name: 'managed.run', version: 1 },
+    status: 'failure',
+    session_id: null,
+    provider: null,
+    model: null,
+    juno_version: VERSION,
+    error: {
+      code: 'EXECUTION_FAILED',
+      message: (error instanceof Error ? error.message : String(error)).slice(0, 4096),
+      exit_code: exitCode,
+    },
+    cost: { completeness: 'unavailable', usd: null },
+  })}\n`);
+}
+
 function handleCLIError(error: unknown, verbose: number = 0): void {
   if (error instanceof Error && error.name.startsWith('SessionContinuity')) {
     console.error(chalk.red.bold('\n❌ Branch Registry Error'));
@@ -218,6 +241,7 @@ function handleCLIError(error: unknown, verbose: number = 0): void {
     console.error(chalk.yellow('\n💡 Suggestions:'));
     console.error(chalk.yellow("   • Run ypl 'init' or yylo pi 'init' first to create the main branch"));
     console.error(chalk.yellow('   • Inspect branches with: yylo branches'));
+    writeSelectedMachineError(error, 1);
     process.exit(1);
     return;
   }
@@ -243,6 +267,7 @@ function handleCLIError(error: unknown, verbose: number = 0): void {
       ? (error as any).code
       : EXIT_CODES.UNEXPECTED_ERROR;
 
+    writeSelectedMachineError(error, exitCode);
     process.exit(exitCode);
     return;
   }
@@ -256,6 +281,7 @@ function handleCLIError(error: unknown, verbose: number = 0): void {
     console.error(error.stack);
   }
 
+  writeSelectedMachineError(error, EXIT_CODES.UNEXPECTED_ERROR);
   process.exit(EXIT_CODES.UNEXPECTED_ERROR);
 }
 
@@ -1472,7 +1498,7 @@ function setupTaskLifecycleCommand(program: Command): void {
       .allowUnknownOption(true)
       .option('--task <task-id>', 'Legacy task ID (ignored)')
       .action(() => {
-        console.error('The legacy lifecycle executor was removed. Use `yy task start|status|finish` and `yy merge status|next|resolve`.');
+        console.error('The legacy lifecycle executor was removed. Use `yy task start|status|finish` and `yy merge status|land|project`.');
         process.exitCode = 2;
       });
   }
@@ -1582,7 +1608,8 @@ ${chalk.blue('Model Shorthands:')}
   ${chalk.gray('# OpenAI / OpenAI Codex')}
   :luna                openai-codex/gpt-5.6-luna
   :sol                 openai-codex/gpt-5.6-sol
-  :gpt                 :sol ${chalk.gray('(default)')}
+  :gpt                 openai-codex/gpt-6-astra ${chalk.gray('(default)')}
+  :astra               openai-codex/gpt-6-astra
   :gpt5.5              openai-codex/gpt-5.5
   :mini                openai-codex/gpt-5.6-terra
   :gpt-5               openai/gpt-5
@@ -1616,7 +1643,7 @@ ${chalk.blue('Service-Specific Options:')}
   --live                    Run Pi in interactive TUI mode (auto-exits on non-aborted completion)
 
 ${chalk.blue('Environment Variables:')}
-  PI_MODEL                  Model override (default: :gpt → openai-codex/gpt-5.6-sol)
+  PI_MODEL                  Model override (default: :gpt → openai-codex/gpt-6-astra)
   PI_PROVIDER               Provider override
   PI_PROJECT_PATH           Project directory
   PI_THINKING               Thinking level
@@ -2068,13 +2095,15 @@ function configureCommandSurface(program: Command): void {
   configureKanbanCommand(program);
   configureTaskWorkspaceCommand(program);
   configureIntegrationCommand(program);
-  configureMergeQueueCommand(program);
+  configureMergeCommand(program);
   configureWatchCommand(program);
   configureEvidenceCommand(program);
   configureMigrationCommand(program);
   configureWorkspaceCommands(program, VERSION);
   configureWikiCommand(program);
   configureLoopCommand(program);
+  configureCapabilitiesCommand(program);
+  configureTmuxCommand(program);
   configureBenchmarkCommand(program);
   setupCompletion(program);
   setupAliases(program);
@@ -2103,7 +2132,9 @@ async function main(): Promise<void> {
     return;
   }
   if (explicitInvocation.kind === 'unknown-command' || explicitInvocation.kind === 'unknown-option') {
-    console.error(formatExplicitInvocationError(explicitInvocation, process.argv[1] ?? __filename, VERSION));
+    const message = formatExplicitInvocationError(explicitInvocation, process.argv[1] ?? __filename, VERSION);
+    console.error(message);
+    writeSelectedMachineError(new Error(message), 2);
     process.exitCode = 2;
     return;
   }
@@ -2148,9 +2179,10 @@ async function main(): Promise<void> {
   const isReadOnlyLifecycleStatus = isLifecycleCommand && commandArgs[1] === 'status';
   const isReadOnlyTaskStatus = isTaskWorkspaceCommand && commandArgs[1] === 'status';
   const isScriptsDoctor = commandArgs[0] === 'scripts' && commandArgs[1] === 'doctor';
-  const isWorkspaceDiscovery = commandArgs[0] === 'info' || commandArgs[0] === 'where' || (commandArgs[0] === 'doctor' && commandArgs[1] === 'workspace');
+  const isWorkspaceDiscovery = commandArgs[0] === 'info' || commandArgs[0] === 'where' || commandArgs[0] === 'capabilities' || (commandArgs[0] === 'doctor' && commandArgs[1] === 'workspace');
+  const isTmuxCommand = commandArgs[0] === 'tmux';
   const isControlPlaneCommand = ['ledger', 'kanban', 'task', 'merge', 'integration'].includes(commandArgs[0] ?? '');
-  const isReadOnlyIdentityRequest = isReadOnlyVersionRequest || isReadOnlyLifecycleStatus || isReadOnlyTaskStatus || isMigrationCommand || isScriptsDoctor || isWorkspaceDiscovery || isControlPlaneCommand;
+  const isReadOnlyIdentityRequest = isReadOnlyVersionRequest || isReadOnlyLifecycleStatus || isReadOnlyTaskStatus || isMigrationCommand || isScriptsDoctor || isWorkspaceDiscovery || isTmuxCommand || isControlPlaneCommand;
   const isForceUpdate = process.argv.includes('--force-update');
   const isExplicitProjectAssetUpdate =
     isForceUpdate ||
@@ -2441,6 +2473,7 @@ process.on('unhandledRejection', async (reason, promise) => {
   console.error(chalk.red('   This is likely a bug. Please report it.'));
   console.error(chalk.gray('   Promise:'), promise);
   console.error(chalk.gray('   Reason:'), reason);
+  writeSelectedMachineError(reason, EXIT_CODES.UNEXPECTED_ERROR);
   process.exit(EXIT_CODES.UNEXPECTED_ERROR);
 });
 
@@ -2464,6 +2497,7 @@ process.on('uncaughtException', async (error) => {
   console.error(chalk.red('   This is likely a bug. Please report it.'));
   console.error(chalk.gray('   Error:'), error.message);
   console.error(chalk.gray('   Stack:'), error.stack);
+  writeSelectedMachineError(error, EXIT_CODES.UNEXPECTED_ERROR);
   process.exit(EXIT_CODES.UNEXPECTED_ERROR);
 });
 
@@ -2511,6 +2545,7 @@ export { main, handleCLIError };
 const reportFatalError = (error: unknown) => {
   console.error(chalk.red.bold('\n💥 Fatal Error'));
   console.error(chalk.red(`   ${error instanceof Error ? error.message : String(error)}`));
+  writeSelectedMachineError(error, EXIT_CODES.UNEXPECTED_ERROR);
   process.exit(EXIT_CODES.UNEXPECTED_ERROR);
 };
 

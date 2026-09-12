@@ -42,6 +42,20 @@ describe('Juno 2 Kanban compatibility policy', () => {
     );
     expect(result.status === 0).toBe(accepted);
   });
+
+  it.each([
+    ['yylo-ledger 0.3.0', true],
+    ['yylo-ledger 0.2.0', false],
+    ['yylo-ledger 0.3.0rc1', false],
+    ['yylo-ledger 0.4.0', false],
+  ])('validates exact Ledger identity %j', (output, accepted) => {
+    const result = spawnSync(
+      'bash',
+      ['-c', 'source "$1"; yylo_ledger_parse_compatible_version "$2"', 'test', policy, output],
+      { encoding: 'utf8' },
+    );
+    expect(result.status === 0).toBe(accepted);
+  });
 });
 
 describe('Juno 2 shipped guidance', () => {
@@ -85,7 +99,7 @@ describe('Juno 2 shipped guidance', () => {
       expect(guidance).toMatch(/bare `pi`|bare pi/i);
       expect(guidance).toMatch(/provider\/model|provider and model/);
     }
-    expect(agents).toContain('Implementation and repair agents never launch lifecycle-semantic reviewers');
+    expect(agents).toContain('Tests and semantic reviews are explicit project checks outside merge');
     expect(agents).toContain('yy task preflight TASK_ID');
 
     const skillPaths = [

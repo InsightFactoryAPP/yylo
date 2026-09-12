@@ -63,6 +63,7 @@ SEMVER_RE = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z"
 )
 RUNTIME_PATH = ".juno_task/scripts/task_workspace.py"
+MANAGED_GENERATION_PATH = ".juno_task/runtime/managed-controller/generation.json"
 TASK_HYDRATE_RECOVERY_SCHEMA = "juno_task_hydrate_recovery.v1"
 # Stable package-router capability. Parser command ordering may evolve without
 # invalidating hydrate recovery selection.
@@ -1046,18 +1047,6 @@ def _record_queue_attribution(controller: Path, data: bytes) -> None:
             os.unlink(temporary)
 
 
-def assign_enqueue_sequence(state: dict[str, Any]) -> int:
-    meta = state["queues"].setdefault(
-        "task_workspace_fifo", {"schema_version": "juno_task_workspace_fifo.v1", "next": 1}
-    )
-    try:
-        value = decisions.next_enqueue_sequence(meta)
-    except ValueError as exc:
-        raise TaskWorkspaceError(str(exc)) from exc
-    meta["next"] += 1
-    return value
-
-
 @contextmanager
 def state_lock(controller: Path) -> Iterator[Callable[[bool], None]]:
     # Runtime locks are ignored controller-local state; only tasks.json is durable truth.
@@ -1799,10 +1788,38 @@ def require_current_runtime(repository: Path, target_sha: str,
         )
     if not generation["current"]:
         if source_repository:
+            previous = None
+            if controller is not None:
+                try:
+                    managed = json.loads((controller / MANAGED_GENERATION_PATH).read_text())
+                    candidate = managed.get("target_sha") if isinstance(managed, dict) else None
+                    previous = candidate if isinstance(candidate, str) and SHA_RE.fullmatch(candidate) else None
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if previous is None:
+                history = run(["git", "-C", str(repository), "rev-list", "--max-count=256",
+                               target_sha, "--", RUNTIME_PATH], repository, check=False)
+                for candidate in history.stdout.splitlines() if history.returncode == 0 else []:
+                    blob = target_blob(repository, candidate, RUNTIME_PATH)
+                    if blob is not None and hashlib.sha256(blob).hexdigest() == generation["running_sha256"]:
+                        previous = candidate
+                        break
+            if previous and controller is not None:
+                prefix = Path.home() / ".local/share/juno/runtimes" / f"source-{target_sha[:12]}"
+                receipt = Path("/tmp") / f"yylo-source-runtime-adoption-{target_sha[:12]}.json"
+                raise TaskWorkspaceError(
+                    "managed task runtime differs from a Juno source target. Complete safe recovery: "
+                    f"`yy integration runtime-adopt-source --previous-sha {previous} "
+                    f"--target-sha {target_sha} --install-prefix {shlex.quote(str(prefix))} "
+                    f"--output {shlex.quote(str(receipt))}`; this one transaction builds and authenticates "
+                    "the exact unpublished artifact, rebinds the clean controller, refreshes managed runtime, "
+                    "runs runtime-doctor, and verifies task-start admission; do not use "
+                    "runtime-install-rebind or runtime-refresh alone"
+                )
             raise TaskWorkspaceError(
-                "managed task runtime differs from a Juno source target; use a controller "
-                "package/runtime matching that target, or atomically update the source package "
-                "template, tracked runtime, and managed inventory if an upgrade is intended"
+                "managed task runtime differs from a Juno source target; recover only with the complete "
+                "`yy integration runtime-adopt-source --help` transaction (the current managed generation "
+                "identity is unavailable), not runtime-install-rebind or runtime-refresh alone"
             )
         target_runtime = target_blob(repository, target_sha, RUNTIME_PATH)
         _, legacy_provenance = _consumer_runtime_provenance(
@@ -2445,7 +2462,7 @@ def record_control_audit(controller: Path, surface: str, operation: str,
             "lease-status", "lease-heartbeat", "lease-handoff", "lease-successor",
             "lease-revoke", "lease-release"}:
         raise TaskWorkspaceError(f"unsupported task audit operation: {operation}")
-    if surface == "merge" and operation not in {"status", "drive", "next", "resolve", "review", "reopen", "reconcile", "refresh", "withdraw", "recover-full-suite-failure", "recover-repair-predispatch", "recover-authority-drift", "supersede-lifecycle-journal"}:
+    if surface == "merge" and operation not in {"status", "land", "project"}:
         raise TaskWorkspaceError(f"unsupported merge audit operation: {operation}")
     if forwarded_policy is not None and forwarded_policy != expected_policy:
         raise TaskWorkspaceError(
@@ -2867,7 +2884,9 @@ def _kanban_lifecycle_fields(lifecycle_state: str, disposition: Optional[str],
 def project_kanban_lifecycle(controller: Path, task_id: str, lifecycle_state: str, *,
                              phase: Optional[str] = None,
                              record: Optional[dict[str, Any]] = None,
-                             allow_done: bool = False) -> dict[str, Any]:
+                             allow_done: bool = False,
+                             commit_hash: Optional[str] = None,
+                             response: Optional[str] = None) -> dict[str, Any]:
     """Project one lifecycle state onto the canonical board, fail-closed.
 
     Idempotent: an already-projected board returns ``verified`` without a
@@ -2878,9 +2897,12 @@ def project_kanban_lifecycle(controller: Path, task_id: str, lifecycle_state: st
         raise KanbanSyncError(f"lifecycle state has no board projection: {lifecycle_state}",
                               {"task_id": task_id, "lifecycle_state": lifecycle_state})
     board_status = LIFECYCLE_BOARD_STATUS[lifecycle_state]
+    if commit_hash is not None and (board_status != "done" or not re.fullmatch(r"[0-9a-f]{40}", commit_hash)):
+        raise KanbanSyncError("only a verified merged projection may carry an integration commit",
+                              {"task_id": task_id, "lifecycle_state": lifecycle_state})
     if board_status == "done" and not allow_done:
-        # Verified merge finalization exclusively owns the done mutation; the
-        # projection only verifies it after the fact.
+        # Native delivery projection exclusively owns the done mutation; this
+        # helper only verifies it after the fact.
         current = read_kanban_task(controller, task_id)
         if current.get("status") == "done":
             return {"schema_version": KANBAN_SYNC_SCHEMA, "task_id": task_id,
@@ -2889,10 +2911,10 @@ def project_kanban_lifecycle(controller: Path, task_id: str, lifecycle_state: st
                     "board_status": "done",
                     "recovery_command": None}
         raise KanbanSyncError(
-            "merge finalization owns the done mutation; run the merge queue recovery",
+            "native delivery projection owns the done mutation; retry Ledger projection",
             {"task_id": task_id, "lifecycle_state": lifecycle_state,
              "board_status": current.get("status"),
-             "recovery_command": "yy merge next"})
+             "recovery_command": f"yy merge project {task_id}"})
     disposition = LIFECYCLE_DISPOSITIONS.get(lifecycle_state)
     continuation = None
     if isinstance(record, dict):
@@ -2908,11 +2930,18 @@ def project_kanban_lifecycle(controller: Path, task_id: str, lifecycle_state: st
     current_fields = current.get("fields") if isinstance(current.get("fields"), dict) else {}
     if (current_status == board_status
             and all(current_fields.get(key) == value
-                    for key, value in desired_fields.items())):
+                    for key, value in desired_fields.items())
+            and (commit_hash is None or current.get("commit_hash") == commit_hash)):
         return {"schema_version": KANBAN_SYNC_SCHEMA, "task_id": task_id,
                 "lifecycle_state": lifecycle_state, "outcome": "verified",
                 "board_status": board_status,
                 "board_revision": kanban_board_revision(controller, task_id)}
+    if (current_status == "done" and commit_hash is not None
+            and current.get("commit_hash") not in {None, commit_hash}):
+        raise KanbanSyncError(
+            "canonical Kanban task is done with a different integration commit",
+            {"task_id": task_id, "lifecycle_state": lifecycle_state,
+             "board_status": current_status, "commit_hash": current.get("commit_hash")})
     if current_status in TERMINAL_TASK_STATUSES and board_status not in TERMINAL_TASK_STATUSES:
         # A manual owner change is preserved, never overwritten.
         raise KanbanSyncError(
@@ -2926,7 +2955,8 @@ def project_kanban_lifecycle(controller: Path, task_id: str, lifecycle_state: st
     identity = {"schema_version": KANBAN_SYNC_SCHEMA, "task_id": task_id,
                 "lifecycle_state": lifecycle_state, "phase": phase,
                 "board_status": board_status, "expected_revision": revision,
-                "fields": desired_fields}
+                "fields": desired_fields, "commit_hash": commit_hash,
+                "response": response}
     receipt_path = _kanban_sync_receipt_path(controller, task_id, identity)
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     argv = ["-f", "json", "update", task_id,
@@ -2940,6 +2970,10 @@ def project_kanban_lifecycle(controller: Path, task_id: str, lifecycle_state: st
         argv.append(f"continuation_task_id={json.dumps(continuation)}")
     if current_status != board_status:
         argv += ["--status", board_status]
+    if commit_hash is not None:
+        argv += ["--commit", commit_hash]
+    if response is not None:
+        argv += ["--response", response]
     argv += ["--expected-revision", revision,
              "--receipt-file", str(receipt_path)]
     result = subprocess.run([str(_kanban_wrapper(controller)), *argv], cwd=controller,
@@ -2956,7 +2990,8 @@ def project_kanban_lifecycle(controller: Path, task_id: str, lifecycle_state: st
     readback_fields = readback.get("fields") if isinstance(readback.get("fields"), dict) else {}
     if (readback.get("status") != board_status
             or any(readback_fields.get(key) != value
-                   for key, value in desired_fields.items())):
+                   for key, value in desired_fields.items())
+            or (commit_hash is not None and readback.get("commit_hash") != commit_hash)):
         raise KanbanSyncError("canonical Kanban projection readback mismatched",
                               {"task_id": task_id, "lifecycle_state": lifecycle_state,
                                "board_status": readback.get("status"),
@@ -3149,7 +3184,7 @@ def kanban_sync_doctor(controller: Path, task_id: Optional[str] = None) -> dict[
         selected = [(task_id, records[task_id])]
     rows: list[dict[str, Any]] = []
     drift = 0
-    for current_id, record in selected[:200]:
+    for current_id, record in selected:
         if not isinstance(record, dict):
             continue
         lifecycle_state = record.get("state")
@@ -3165,19 +3200,24 @@ def kanban_sync_doctor(controller: Path, task_id: Optional[str] = None) -> dict[
         except (KanbanSyncError, OSError) as exc:
             board_error = str(exc)[:256]
             reasons.append("kanban_read_failed")
-        if board_error is None:
-            if (expected is not None and expected != "done"
-                    and board_status in PRESTART_TRACKING_STATUSES):
-                reasons.append("active_lifecycle_record_in_backlog_or_todo")
-            if (isinstance(lifecycle_state, str) and lifecycle_state != "MERGED"
-                    and board_status == "done"):
-                reasons.append("board_done_without_merge_truth")
-            if (isinstance(lifecycle_state, str) and lifecycle_state not in {"MERGED", "WITHDRAWN"}
-                    and board_status == "archive"):
-                reasons.append("board_archived_while_lifecycle_active")
-            if (isinstance(lifecycle_state, str)
-                    and board_fields.get("lifecycle_projection") == KANBAN_LIFECYCLE_PROJECTION
-                    and board_fields.get("lifecycle_state") != lifecycle_state):
+        if board_error is None and isinstance(lifecycle_state, str) and expected is not None:
+            if board_status != expected:
+                if expected == "in_progress" and board_status in PRESTART_TRACKING_STATUSES:
+                    reasons.append("active_lifecycle_record_in_backlog_or_todo")
+                elif expected == "done":
+                    reasons.append("merged_lifecycle_not_done_on_board")
+                elif lifecycle_state == "WITHDRAWN":
+                    reasons.append("withdrawn_board_status_mismatch")
+                elif board_status == "done":
+                    reasons.append("board_done_without_merge_truth")
+                elif board_status == "archive":
+                    reasons.append("board_archived_while_lifecycle_active")
+                else:
+                    reasons.append("board_status_mismatch")
+            projection = board_fields.get("lifecycle_projection")
+            if projection != KANBAN_LIFECYCLE_PROJECTION:
+                reasons.append("lifecycle_projection_missing")
+            elif board_fields.get("lifecycle_state") != lifecycle_state:
                 reasons.append("lifecycle_field_stale")
         if isinstance(record.get("kanban_sync"), dict) and record["kanban_sync"].get("status") == "required":
             reasons.append("kanban_sync_required")
@@ -3188,7 +3228,9 @@ def kanban_sync_doctor(controller: Path, task_id: Optional[str] = None) -> dict[
                      "expected_board_status": expected,
                      "agreement": "drift" if reasons else "agree",
                      "reasons": reasons,
-                     "recovery_command": (KANBAN_SYNC_RECOVERY.format(task=current_id)
+                     "recovery_command": ((f"yy merge project {current_id}"
+                                            if lifecycle_state == "MERGED"
+                                            else KANBAN_SYNC_RECOVERY.format(task=current_id))
                                            if reasons else None)})
     return {"schema_version": KANBAN_SYNC_SCHEMA, "task_id": task_id,
             "rows": rows,
@@ -4969,7 +5011,7 @@ def _finish_once(controller: Path, task_id: str,
                 or queued_ref_sha != queued_record.get("tip_sha")):
             raise TaskWorkspaceError(
                 f"task is queued at {queued_record.get('tip_sha')} but its branch/worktree tip is "
-                f"{queued_head}; use `yy merge reopen {task_id}` for a descendant correction or "
+                f"{queued_head}; create a new task for a descendant correction or "
                 "restore the exact queued tip before retrying finish")
         try:
             queue_sync = ensure_kanban_sync(controller, task_id, queued_record, phase="queued")
@@ -5081,7 +5123,6 @@ def _finish_once(controller: Path, task_id: str,
                 raise TaskWorkspaceError(
                     f"frozen umbrella admission drifted before queue mutation: {json.dumps(final_drift, sort_keys=True)}"
                 )
-        queued["enqueue_sequence"] = assign_enqueue_sequence(state)
         state["tasks"][task_id] = queued
         write_state(controller, state)
     try:
@@ -5875,8 +5916,8 @@ def _target_ref_holders(repository: Path, target_ref: str) -> list[dict[str, Any
 
 @contextmanager
 def _target_mutation_lock(repository: Path, target_ref: str) -> Iterator[None]:
-    # Contend on the merge queue's repository/ref lock inode. Runtime recovery
-    # and queue delivery must never mutate the same target concurrently.
+    # Contend on the native delivery adapter's repository/ref lock inode. Runtime
+    # recovery and delivery must never mutate the same target concurrently.
     common = Path(git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     key = hashlib.sha256(f"{common}\0{target_ref}".encode()).hexdigest()
     path = common / "juno-locks/merge-queue" / f"{key}.lock"
@@ -6683,7 +6724,7 @@ def _task_projection(controller: Path, task_id: str, run_dir: Path,
         kind="task-run", run_id=journal["run_id"], task_id=task_id, state=state_name,
         plan=plan, started=lifecycle_runtime.lifecycle_elapsed_started(journal),
         counters=counters, attempts=attempts, blocker=blocker,
-        next_action=(f"yy merge drive --through {task_id}" if state_name == "QUEUED" else
+        next_action=(f"yy merge land {task_id}" if state_name == "QUEUED" else
                     (f"resolve the blocker and resume yy task run {task_id}"
                      if state_name == "NEEDS_DECISION" else
                      # BLOCKED is terminal: replaying yy task run returns this
