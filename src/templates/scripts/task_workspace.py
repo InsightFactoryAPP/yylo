@@ -3645,7 +3645,11 @@ def start(controller: Path, task_id: str, requested_paths: Optional[list[str]] =
                     ) from creation_error
             raise
     return {**record, "outcome": "started", "lease_token": initial_token,
-            "lease_note": "store this fencing token; gated task mutations require --lease-token"}
+            "lease_note": "store this fencing token privately; it remains valid after this "
+            "command exits until the attempt is superseded or terminated. At the unchanged "
+            f"clean base: yy task start {task_id} --lease-token <returned-token>; "
+            "pass the same token to subsequent gated commands such as finish. "
+            "Do not issue a successor merely because the helper exited; never log the token"}
 
 
 def hydrate(controller: Path, task_id: str, lease_token: Optional[str] = None) -> dict[str, Any]:
@@ -5330,7 +5334,10 @@ def status(controller: Path, task_id: str) -> dict[str, Any]:
     result["producer_fence"] = {
         "state": lease.get("state") if isinstance(lease, dict) else "NONE",
         "attempt": lease.get("attempt") if isinstance(lease, dict) else None,
-        "producer_status": observation.status, "detail": observation.detail}
+        "producer_status": observation.status, "detail": observation.detail,
+        "note": "producer liveness is not token validity; the current token admits manual "
+        "gated commands with --lease-token even after the helper exits. "
+        "This read-only status does not test a token"}
     result["mutation_eligibility"] = {
         "operation": eligibility.operation, "eligible": eligibility.eligible,
         "reason_code": eligibility.reason_code,
@@ -7021,8 +7028,10 @@ def _wall_recovery_runtime_identity(controller: Path, plan: dict[str, Any],
             controller, "task-run", plan["task_id"], model_identity=plan.get("model_identity"))
     except lifecycle_runtime.LifecycleContractError as exc:
         raise TaskWorkspaceError("wall-budget recovery runtime/policy identity drifted") from exc
+    # Controller checkpoints change HEAD, not the frozen executable policy.
+    # The execution digest excludes only checkpoint/compiled-plan identity;
+    # prompts, templates, model, budgets and compiler bytes remain exact.
     if (_task_plan_execution_identity(current) != journal.get("execution_identity_sha256")
-            or current.get("controller_commit") != plan.get("controller_commit")
             or current.get("template") != plan.get("template")
             or current.get("budgets") != plan.get("budgets")
             or current.get("runtime_sha256") != plan.get("runtime_sha256")):
@@ -7949,7 +7958,9 @@ def lease_status(controller: Path, task_id: str) -> dict[str, Any]:
         "producer_observation": {"status": observation.status, "detail": observation.detail}
         if observation else None,
         "mutation_authority": {"admitted": authority.admitted, "code": authority.code,
-                               "message": authority.message},
+                               "message": authority.message,
+                               "note": "observed without a token; the current token still "
+                               "admits manual gated commands after the helper exits"},
         "successor_readiness": {"admitted": successor.admitted, "code": successor.code,
                                 "authority_kind": successor.authority_kind,
                                 "message": successor.message},
@@ -8151,7 +8162,14 @@ def lease_successor(controller: Path, task_id: str,
                 "authority_kind": plan.authority_kind, "lease_token": token,
                 "recovery": recovery,
                 "receipt": receipt,
-                "note": "the lease token is shown once; store it and present it via --lease-token"}
+                "note": "the lease token is shown once; store it privately. It remains valid "
+                "after this command exits until the attempt is superseded or terminated. "
+                "Retry the original gated command with --lease-token <returned-token>. "
+                f"At the unchanged clean base: yy task start {task_id} --lease-token <returned-token>; "
+                "pass the same token to subsequent gated commands such as finish. "
+                "Tokenless manual retry is not authorized; do not repeat successor when "
+                "you have its token. Recovery classification is not hydration or validation "
+                "clearance; never log the token"}
 
 
 def lease_release(controller: Path, task_id: str, lease_token: Optional[str]) -> dict[str, Any]:
